@@ -19,11 +19,16 @@ use crate::unknown_fields::{UnknownFieldData, UnknownFields};
 
 /// Depth cap for heuristically parsing length-delimited unknown fields as
 /// nested messages. Matches C++ `kUnknownFieldRecursionLimit`
-/// (text_format.cc:2306). Independent of the parse-time [`RECURSION_LIMIT`]
+/// (text_format.cc:2494). Independent of the parse-time [`RECURSION_LIMIT`]
 /// — this bounds an encode-time *printing* heuristic, not wire decode.
 ///
 /// [`RECURSION_LIMIT`]: crate::RECURSION_LIMIT
 const UNKNOWN_LD_RECURSE_BUDGET: u32 = 10;
+
+/// Maximum group nesting the unknown-field printer will traverse. Decoded
+/// groups already respect this limit; public `UnknownFields::push` can also
+/// construct deeper trees directly.
+const UNKNOWN_GROUP_RECURSE_BUDGET: u32 = crate::RECURSION_LIMIT;
 
 /// What the encoder last emitted — drives separator logic in
 /// [`prepare`](TextEncoder::prepare).
@@ -55,6 +60,14 @@ pub struct TextEncoder<'a> {
     pretty: bool,
     emit_unknown: bool,
     last: Last,
+    /// The extension name that
+    /// [`write_extension_fields`](Self::write_extension_fields) wrote. It is
+    /// set only while that entry's `text_encode` runs and the name is still
+    /// the last thing written: the next write clears it, and so does the
+    /// return of `text_encode`.
+    /// [`write_repeated_extension`](Self::write_repeated_extension) writes it
+    /// again before each element after the first.
+    ext_name: Option<&'static str>,
 }
 
 impl<'a> TextEncoder<'a> {
@@ -67,6 +80,7 @@ impl<'a> TextEncoder<'a> {
             pretty: false,
             emit_unknown: false,
             last: Last::Open,
+            ext_name: None,
         }
     }
 
@@ -80,6 +94,7 @@ impl<'a> TextEncoder<'a> {
             pretty: true,
             emit_unknown: false,
             last: Last::Open,
+            ext_name: None,
         }
     }
 
@@ -102,6 +117,7 @@ impl<'a> TextEncoder<'a> {
     fn prepare(&mut self, next: Last) -> core::fmt::Result {
         let prev = self.last;
         self.last = next;
+        self.ext_name = None;
         if !self.pretty {
             // Single line: space between end-of-field and start of next name.
             if prev == Last::Value && next == Last::Name {
@@ -203,7 +219,52 @@ impl<'a> TextEncoder<'a> {
     ) -> core::fmt::Result {
         // No `:` before a message value — just a space before `{`.
         self.prepare(Last::Value)?;
-        self.w.write_str(" {")?;
+        self.w.write_char(' ')?;
+        self.write_message_body(f)
+    }
+
+    /// Write the elements of a repeated message or group extension, after
+    /// the caller has written the extension's bracketed name once.
+    ///
+    /// The two forms are documented on
+    /// [`repeated_message_encode_text`](crate::type_registry::repeated_message_encode_text).
+    /// The per-element form is preferred because a parser reads it without
+    /// support for message lists.
+    pub(crate) fn write_repeated_extension<M: super::TextFormat>(
+        &mut self,
+        messages: &[M],
+    ) -> core::fmt::Result {
+        debug_assert!(self.ext_name.is_none() || self.last == Last::Name);
+        match (self.ext_name, messages) {
+            (Some(name), [first, rest @ ..]) => {
+                self.write_message(first)?;
+                for message in rest {
+                    self.write_extension_name(name)?;
+                    self.write_message(message)?;
+                }
+                Ok(())
+            }
+            (None, _) | (Some(_), []) => self.write_message_list(messages),
+        }
+    }
+
+    fn write_message_list<M: super::TextFormat>(&mut self, messages: &[M]) -> core::fmt::Result {
+        self.prepare(Last::Value)?;
+        self.w.write_str(": [")?;
+        for (index, message) in messages.iter().enumerate() {
+            if index > 0 {
+                self.w.write_str(", ")?;
+            }
+            self.write_message_body(|enc| message.encode_text(enc))?;
+        }
+        self.w.write_char(']')
+    }
+
+    fn write_message_body(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> core::fmt::Result,
+    ) -> core::fmt::Result {
+        self.w.write_char('{')?;
         self.depth += 1;
         let outer_last = self.last;
         self.last = Last::Open;
@@ -218,12 +279,18 @@ impl<'a> TextEncoder<'a> {
         self.w.write_char('}')
     }
 
-    /// Write `[type_url] { fields }` for a registered `Any` type, or do
-    /// nothing and return `false` if the URL isn't registered.
+    /// Write `[type_url] { fields }` when the registry has an entry for
+    /// `type_url` or for its message full name; otherwise write nothing and
+    /// return `false`.
     ///
     /// `true` means the expanded form was written — the caller skips its
     /// vanilla `type_url: "..." value: "..."` fallback. `false` means
     /// nothing was written — the caller should fall through.
+    ///
+    /// The URL is written between the brackets as given, with no escaping,
+    /// so it is expanded only when it is made of ASCII letters, digits and
+    /// `-._~/:%`. Any other URL returns `false`, and the caller's quoted
+    /// `type_url` field carries it exactly.
     ///
     /// Consults the text-format `Any` map installed via
     /// [`set_type_registry`](crate::type_registry::set_type_registry).
@@ -236,6 +303,13 @@ impl<'a> TextEncoder<'a> {
         type_url: &str,
         value: &[u8],
     ) -> Result<bool, core::fmt::Error> {
+        // `type_url` is input data: a URL with any prefix resolves by its
+        // message name. A `]` would end the bracketed name early and let the
+        // rest of the URL be read as further fields, and whitespace or `#`
+        // would not survive the trip back through the decoder.
+        if !type_url.bytes().all(is_bracket_safe_url_byte) {
+            return Ok(false);
+        }
         let Some(entry) = crate::type_registry::global_text_any(type_url) else {
             return Ok(false);
         };
@@ -254,7 +328,9 @@ impl<'a> TextEncoder<'a> {
     }
 
     /// Write registered extensions from `fields` as `[full_name] { ... }`
-    /// entries. Unregistered field numbers are left for the caller's
+    /// entries: one entry per extension, or one per element for a repeated
+    /// message or group extension.
+    /// Unregistered field numbers are left for the caller's
     /// [`write_unknown_fields`](Self::write_unknown_fields) (debug-only,
     /// default off).
     ///
@@ -276,9 +352,9 @@ impl<'a> TextEncoder<'a> {
         if fields.is_empty() {
             return Ok(());
         }
-        // One emit per field number — the entry's text_encode reads all
-        // records at that number (merge semantics). Mirrors JSON's
-        // serialize_extensions dedup loop.
+        // One `text_encode` call per field number: the entry reads every
+        // record at that number. Mirrors JSON's `serialize_extensions` dedup
+        // loop.
         let mut seen = alloc::collections::BTreeSet::new();
         for uf in fields.iter() {
             if !seen.insert(uf.number) {
@@ -289,7 +365,9 @@ impl<'a> TextEncoder<'a> {
                 continue;
             };
             self.write_extension_name(entry.full_name)?;
+            self.ext_name = Some(entry.full_name);
             (entry.text_encode)(uf.number, fields, self)?;
+            self.ext_name = None;
         }
         Ok(())
     }
@@ -310,10 +388,14 @@ impl<'a> TextEncoder<'a> {
     /// | group | nested `{ ... }` (recursive) | `1004 { 1: 0 }` |
     ///
     /// Length-delimited bytes are speculatively parsed as wire-format records
-    /// (same heuristic as C++ text_format.cc:2926 / Java TextFormat.java:87):
+    /// (same heuristic as C++ text_format.cc:3121 / Java TextFormat.java:87):
     /// if the parse succeeds, print nested; otherwise print as escaped bytes.
-    /// Capped at 10 levels deep. False positives are possible — a string that
-    /// happens to look like valid wire format will be printed as `{ }`.
+    /// Capped at 10 levels deep. Group nesting is capped at
+    /// [`RECURSION_LIMIT`](crate::RECURSION_LIMIT). A group nested past that
+    /// depth is written with an empty body, so the text can omit a subtree,
+    /// and such a group reads the same as an empty one. False positives are
+    /// possible — a string that happens to look like valid wire format will be
+    /// printed as `{ }`.
     ///
     /// This is debug output: the parser can't round-trip it because wire type
     /// doesn't determine proto type (a varint could be int32, sint64, bool, an
@@ -326,10 +408,19 @@ impl<'a> TextEncoder<'a> {
         if !self.emit_unknown {
             return Ok(());
         }
-        self.write_unknown_inner(fields, UNKNOWN_LD_RECURSE_BUDGET)
+        self.write_unknown_inner(
+            fields,
+            UNKNOWN_LD_RECURSE_BUDGET,
+            UNKNOWN_GROUP_RECURSE_BUDGET,
+        )
     }
 
-    fn write_unknown_inner(&mut self, fields: &UnknownFields, budget: u32) -> core::fmt::Result {
+    fn write_unknown_inner(
+        &mut self,
+        fields: &UnknownFields,
+        ld_budget: u32,
+        group_budget: u32,
+    ) -> core::fmt::Result {
         for f in fields.iter() {
             self.prepare(Last::Name)?;
             write!(self.w, "{}", f.number)?;
@@ -350,12 +441,12 @@ impl<'a> TextEncoder<'a> {
                     // Heuristic: try to parse the bytes as wire-format records.
                     // If it parses, it's probably a sub-message — print nested.
                     // If not (or we're out of budget), print as escaped bytes.
-                    // Matches C++ text_format.cc:2926-2966 and Java
+                    // Matches C++ text_format.cc:3121-3160 and Java
                     // TextFormat.java:87-102.
-                    if budget > 0 && !bytes.is_empty() {
+                    if ld_budget > 0 && !bytes.is_empty() {
                         if let Ok(inner) = UnknownFields::decode_from_slice(bytes) {
                             self.write_map_entry(|enc| {
-                                enc.write_unknown_inner(&inner, budget - 1)
+                                enc.write_unknown_inner(&inner, ld_budget - 1, group_budget)
                             })?;
                             continue;
                         }
@@ -365,9 +456,15 @@ impl<'a> TextEncoder<'a> {
                     escape_bytes(bytes, self.w)?;
                 }
                 UnknownFieldData::Group(inner) => {
-                    // Groups don't consume budget — they were already
-                    // validated at decode time (C++ text_format.cc:3009).
-                    self.write_map_entry(|enc| enc.write_unknown_inner(inner, budget))?;
+                    // Limit public, manually constructed groups as well as
+                    // groups that came through the bounded decoder.
+                    self.write_map_entry(|enc| {
+                        if group_budget == 0 {
+                            Ok(())
+                        } else {
+                            enc.write_unknown_inner(inner, ld_budget, group_budget - 1)
+                        }
+                    })?;
                 }
             }
         }
@@ -416,7 +513,13 @@ impl<'a> TextEncoder<'a> {
         write!(self.w, ": {v}")
     }
 
-    /// Write an `f32` value. NaN → `nan`, infinities → `inf`/`-inf`.
+    /// Write an `f32` value as the shortest decimal that reads back as the
+    /// same `f32`, in positional notation (`0.1`, not `0.10000000149011612`).
+    /// NaN is `nan` and the infinities are `inf` and `-inf`.
+    ///
+    /// Where a reader that parses an `f64` and narrows it would take those
+    /// digits to a neighbouring `f32`, the value is written with its `f64`
+    /// digits instead.
     ///
     /// # Errors
     ///
@@ -424,7 +527,20 @@ impl<'a> TextEncoder<'a> {
     pub fn write_f32(&mut self, v: f32) -> core::fmt::Result {
         self.prepare(Last::Value)?;
         self.w.write_str(": ")?;
-        write_float(self.w, v as f64)
+        if v.is_finite() {
+            let mut digits = F32Digits::new();
+            if write!(digits, "{v}").is_ok() {
+                // A reader that parses a `float` as an `f64` and narrows it,
+                // as protobuf C++ and protobuf-go do, rounds twice. For two
+                // values, ±7.038531e-26, that takes the shortest `f32` digits
+                // one ulp away from `v`. They get the widened digits, which
+                // every reader takes back to `v`.
+                if let Some(short) = digits.as_str().filter(|s| narrows_to(s, v)) {
+                    return self.w.write_str(short);
+                }
+            }
+        }
+        write_float(self.w, f64::from(v))
     }
 
     /// Write an `f64` value. NaN → `nan`, infinities → `inf`/`-inf`.
@@ -494,6 +610,48 @@ impl<'a> TextEncoder<'a> {
     }
 }
 
+/// The `Display` text of one finite `f32`, held on the stack.
+struct F32Digits {
+    buf: [u8; Self::CAPACITY],
+    len: usize,
+}
+
+impl F32Digits {
+    /// Buffer length in bytes. A finite `f32` prints as at most 48 bytes (a
+    /// sign and `0.` before 45 decimal places, for example the negative
+    /// subnormal nearest zero), so 64 leaves a margin. A longer text fails
+    /// the write, and `write_f32` then prints the `f64` digits.
+    const CAPACITY: usize = 64;
+
+    const fn new() -> Self {
+        Self {
+            buf: [0; Self::CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(self.buf.get(..self.len)?).ok()
+    }
+}
+
+impl Write for F32Digits {
+    fn write_str(&mut self, s: &str) -> core::fmt::Result {
+        let end = self.len + s.len();
+        let dst = self.buf.get_mut(self.len..end).ok_or(core::fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+/// Whether `digits`, parsed as an `f64` and narrowed, is exactly `v`.
+fn narrows_to(digits: &str, v: f32) -> bool {
+    digits
+        .parse::<f64>()
+        .is_ok_and(|wide| (wide as f32).to_bits() == v.to_bits())
+}
+
 /// Write a float with textproto conventions for non-finites.
 fn write_float(w: &mut dyn Write, v: f64) -> core::fmt::Result {
     if v.is_nan() {
@@ -511,10 +669,26 @@ fn write_float(w: &mut dyn Write, v: f64) -> core::fmt::Result {
     }
 }
 
+/// Whether `b` can stand in a type URL written between brackets and be read
+/// back unchanged: an ASCII letter or digit, or one of `-._~/:%`.
+fn is_bracket_safe_url_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~' | b'/' | b':' | b'%')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use alloc::string::String;
+
+    #[test]
+    fn bracket_safe_url_bytes() {
+        let safe = "type.googleapis.com/pkg.Msg_1~-:%";
+        assert!(safe.bytes().all(is_bracket_safe_url_byte));
+        for unsafe_byte in *b"[]{}#\"' \t\n\\<>," {
+            assert!(!is_bracket_safe_url_byte(unsafe_byte), "{unsafe_byte:#04x}");
+        }
+        assert!(!"é".bytes().any(is_bracket_safe_url_byte));
+    }
 
     #[test]
     fn single_line_scalars() {
@@ -589,6 +763,101 @@ mod tests {
         }
     }
 
+    fn f32_text(v: f32) -> String {
+        let mut s = String::new();
+        let mut enc = TextEncoder::new(&mut s);
+        enc.write_field_name("f").unwrap();
+        enc.write_f32(v).unwrap();
+        s
+    }
+
+    #[test]
+    fn f32_uses_its_own_shortest_digits() {
+        #[rustfmt::skip]
+        let cases: &[(f32, &str)] = &[
+            (0.1,               "f: 0.1"),
+            (-2.2,              "f: -2.2"),
+            (1.5,               "f: 1.5"),
+            (-0.0,              "f: -0"),
+            // Nine significant digits, the most an `f32` needs.
+            (10.000_010_5,      "f: 10.0000105"),
+            (f32::MAX,          "f: 340282350000000000000000000000000000000"),
+            (f32::NAN,          "f: nan"),
+            (f32::NEG_INFINITY, "f: -inf"),
+        ];
+        for &(v, want) in cases {
+            assert_eq!(f32_text(v), want, "value: {v}");
+        }
+    }
+
+    #[test]
+    fn f32_digits_hold_the_longest_values() {
+        // No `f32` is longer than the negative subnormal nearest zero, 48
+        // bytes. A value that outgrew the buffer would print its widened
+        // digits.
+        for v in [
+            -f32::from_bits(1),
+            -f32::MIN_POSITIVE,
+            f32::MIN,
+            -f32::from_bits(0x007f_ffff),
+        ] {
+            let short = alloc::format!("{v}");
+            assert!(short.len() <= F32Digits::CAPACITY, "value: {v}");
+            assert_eq!(f32_text(v), alloc::format!("f: {short}"), "value: {v}");
+        }
+        assert_eq!(alloc::format!("{}", -f32::from_bits(1)).len(), 48);
+    }
+
+    #[test]
+    fn f32_digits_reject_text_past_the_capacity() {
+        let mut digits = F32Digits::new();
+        for _ in 0..F32Digits::CAPACITY {
+            digits.write_str("1").unwrap();
+        }
+        assert!(digits.write_str("1").is_err());
+        assert_eq!(digits.as_str().map(str::len), Some(F32Digits::CAPACITY));
+    }
+
+    #[test]
+    fn f32_keeps_widened_digits_where_a_narrowing_reader_would_miss() {
+        // The shortest digits of this value are `7.038531e-26`. Read as an
+        // `f64` and narrowed, they give its neighbour 0x15ae_43fe.
+        // `f32_fallback_values_exhaustive` shows that this value and its
+        // negation are the only ones.
+        for v in [f32::from_bits(0x15ae_43fd), -f32::from_bits(0x15ae_43fd)] {
+            let short = alloc::format!("{v}");
+            assert!(!narrows_to(&short, v));
+
+            let text = f32_text(v);
+            let digits = text.strip_prefix("f: ").unwrap();
+            assert_ne!(digits, short);
+            assert_eq!(digits, alloc::format!("{}", f64::from(v)));
+            // Both kinds of reader take the widened digits back to `v`.
+            assert!(narrows_to(digits, v));
+            assert_eq!(digits.parse::<f32>().unwrap().to_bits(), v.to_bits());
+        }
+    }
+
+    #[test]
+    #[ignore = "visits every f32; run with --release"]
+    fn f32_fallback_values_exhaustive() {
+        let mut fallbacks = alloc::vec::Vec::new();
+        for bits in 0..=u32::MAX {
+            let v = f32::from_bits(bits);
+            if !v.is_finite() {
+                continue;
+            }
+            let mut digits = F32Digits::new();
+            write!(digits, "{v}").unwrap();
+            let short = digits.as_str().unwrap();
+            assert_eq!(short.parse::<f32>().unwrap().to_bits(), bits);
+            if !narrows_to(short, v) {
+                fallbacks.push(bits);
+            }
+        }
+        assert_eq!(fallbacks, [0x15ae_43fd, 0x95ae_43fd]);
+    }
+
     #[test]
     fn extension_name() {
         let mut s = String::new();
@@ -654,6 +923,58 @@ mod tests {
         assert_eq!(
             s,
             r#"1001: 42 1002: 0x3f800000 1003: 0xdeadbeef 1004: "\001\377" 1005 {1: 7}"#
+        );
+    }
+
+    #[test]
+    fn unknown_group_depth_is_bounded() {
+        use crate::unknown_fields::UnknownField;
+
+        fn group_chain(depth: u32) -> UnknownFields {
+            let mut nested = UnknownFields::new();
+            nested.push(UnknownField {
+                number: 2,
+                data: UnknownFieldData::Varint(7),
+            });
+            for _ in 0..depth {
+                let mut parent = UnknownFields::new();
+                parent.push(UnknownField {
+                    number: 1,
+                    data: UnknownFieldData::Group(nested),
+                });
+                nested = parent;
+            }
+            nested
+        }
+
+        fn render(fields: &UnknownFields) -> String {
+            let mut s = String::new();
+            TextEncoder::new(&mut s)
+                .emit_unknown(true)
+                .write_unknown_fields(fields)
+                .unwrap();
+            s
+        }
+
+        let at_limit = render(&group_chain(crate::RECURSION_LIMIT));
+        assert_eq!(
+            at_limit.matches('{').count(),
+            crate::RECURSION_LIMIT as usize
+        );
+        assert!(
+            at_limit.contains(": 7"),
+            "the limit-depth body was not printed"
+        );
+
+        let too_deep = render(&group_chain(crate::RECURSION_LIMIT + 25));
+        assert_eq!(
+            too_deep.matches('{').count(),
+            crate::RECURSION_LIMIT as usize + 1,
+            "over-depth groups should stop at the recursion limit: {too_deep}"
+        );
+        assert!(
+            !too_deep.contains(": 7"),
+            "the over-depth group body was printed"
         );
     }
 

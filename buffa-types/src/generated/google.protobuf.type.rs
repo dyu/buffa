@@ -69,6 +69,7 @@ impl ::buffa::Enumeration for Syntax {
 /// FileDescriptorSet which preserves the necessary information.
 #[derive(Clone, PartialEq, Default)]
 #[cfg_attr(feature = "arbitrary", derive(::arbitrary::Arbitrary))]
+#[derive(Eq, Hash)]
 pub struct Type {
     /// The fully qualified message name.
     ///
@@ -285,9 +286,9 @@ impl ::buffa::Message for Type {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
-        if self.source_context.is_set() {
+        if let ::core::option::Option::Some(__v) = self.source_context.as_option() {
             let __slot = __cache.reserve();
-            let inner_size = self.source_context.compute_size(__cache);
+            let inner_size = __v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -334,13 +335,13 @@ impl ::buffa::Message for Type {
             );
             v.write_to(__cache, buf);
         }
-        if self.source_context.is_set() {
+        if let ::core::option::Option::Some(__v) = self.source_context.as_option() {
             ::buffa::types::put_len_delimited_header(
                 5u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.source_context.write_to(__cache, buf);
+            __v.write_to(__cache, buf);
         }
         {
             let val = self.syntax.to_i32();
@@ -471,9 +472,9 @@ impl ::buffa::text::TextFormat for Type {
             enc.write_field_name("name")?;
             enc.write_string(&self.name)?;
         }
-        if self.source_context.is_set() {
+        if let ::core::option::Option::Some(__v) = self.source_context.as_option() {
             enc.write_field_name("source_context")?;
-            enc.write_message(&*self.source_context)?;
+            enc.write_message(__v)?;
         }
         if self.syntax.to_i32() != 0 {
             enc.write_field_name("syntax")?;
@@ -530,7 +531,7 @@ impl ::buffa::text::TextFormat for Type {
                     )?
                 }
                 "oneofs" => {
-                    dec.read_repeated_into(
+                    dec.read_repeated_scalar_into(
                         &mut self.oneofs,
                         |__d| ::core::result::Result::Ok(__d.read_string()?.into_owned()),
                     )?
@@ -565,6 +566,7 @@ pub const __TYPE_TEXT_ANY: ::buffa::type_registry::TextAnyEntry = ::buffa::type_
 /// make use of FileDescriptorSet which preserves the necessary information.
 #[derive(Clone, PartialEq, Default)]
 #[cfg_attr(feature = "arbitrary", derive(::arbitrary::Arbitrary))]
+#[derive(Eq, Hash)]
 pub struct Field {
     /// The field type.
     ///
@@ -1394,6 +1396,7 @@ pub mod field {
 /// make use of FileDescriptorSet which preserves the necessary information.
 #[derive(Clone, PartialEq, Default)]
 #[cfg_attr(feature = "arbitrary", derive(::arbitrary::Arbitrary))]
+#[derive(Eq, Hash)]
 pub struct Enum {
     /// Enum type name.
     ///
@@ -1600,9 +1603,9 @@ impl ::buffa::Message for Enum {
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
                     + inner_size as u64;
         }
-        if self.source_context.is_set() {
+        if let ::core::option::Option::Some(__v) = self.source_context.as_option() {
             let __slot = __cache.reserve();
-            let inner_size = self.source_context.compute_size(__cache);
+            let inner_size = __v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -1646,13 +1649,13 @@ impl ::buffa::Message for Enum {
             );
             v.write_to(__cache, buf);
         }
-        if self.source_context.is_set() {
+        if let ::core::option::Option::Some(__v) = self.source_context.as_option() {
             ::buffa::types::put_len_delimited_header(
                 4u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.source_context.write_to(__cache, buf);
+            __v.write_to(__cache, buf);
         }
         {
             let val = self.syntax.to_i32();
@@ -1771,9 +1774,9 @@ impl ::buffa::text::TextFormat for Enum {
             enc.write_field_name("name")?;
             enc.write_string(&self.name)?;
         }
-        if self.source_context.is_set() {
+        if let ::core::option::Option::Some(__v) = self.source_context.as_option() {
             enc.write_field_name("source_context")?;
-            enc.write_message(&*self.source_context)?;
+            enc.write_message(__v)?;
         }
         if self.syntax.to_i32() != 0 {
             enc.write_field_name("syntax")?;
@@ -1855,6 +1858,7 @@ pub const __ENUM_TEXT_ANY: ::buffa::type_registry::TextAnyEntry = ::buffa::type_
 /// make use of FileDescriptorSet which preserves the necessary information.
 #[derive(Clone, PartialEq, Default)]
 #[cfg_attr(feature = "arbitrary", derive(::arbitrary::Arbitrary))]
+#[derive(Eq, Hash)]
 pub struct EnumValue {
     /// Enum value name.
     ///
@@ -2170,6 +2174,7 @@ pub const __ENUM_VALUE_TEXT_ANY: ::buffa::type_registry::TextAnyEntry = ::buffa:
 /// are strongly discouraged.
 #[derive(Clone, PartialEq, Default)]
 #[cfg_attr(feature = "arbitrary", derive(::arbitrary::Arbitrary))]
+#[derive(Eq, Hash)]
 pub struct Option {
     /// The option's name. For protobuf built-in options (options defined in
     /// descriptor.proto), this is the short name. For example, `"map_entry"`.
@@ -2329,9 +2334,9 @@ impl ::buffa::Message for Option {
         if !self.name.is_empty() {
             size += 1u64 + ::buffa::types::string_encoded_len(&self.name) as u64;
         }
-        if self.value.is_set() {
+        if let ::core::option::Option::Some(__v) = self.value.as_option() {
             let __slot = __cache.reserve();
-            let inner_size = self.value.compute_size(__cache);
+            let inner_size = __v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -2350,13 +2355,13 @@ impl ::buffa::Message for Option {
         if !self.name.is_empty() {
             ::buffa::types::put_string_field(1u32, &self.name, buf);
         }
-        if self.value.is_set() {
+        if let ::core::option::Option::Some(__v) = self.value.as_option() {
             ::buffa::types::put_len_delimited_header(
                 2u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.value.write_to(__cache, buf);
+            __v.write_to(__cache, buf);
         }
         self.__buffa_unknown_fields.write_to(buf);
     }
@@ -2422,9 +2427,9 @@ impl ::buffa::text::TextFormat for Option {
             enc.write_field_name("name")?;
             enc.write_string(&self.name)?;
         }
-        if self.value.is_set() {
+        if let ::core::option::Option::Some(__v) = self.value.as_option() {
             enc.write_field_name("value")?;
-            enc.write_message(&*self.value)?;
+            enc.write_message(__v)?;
         }
         enc.write_unknown_fields(&self.__buffa_unknown_fields)?;
         ::core::result::Result::Ok(())

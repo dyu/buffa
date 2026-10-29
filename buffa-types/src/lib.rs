@@ -36,22 +36,70 @@
 //!
 //! # Ergonomic helpers
 //!
-//! Common Rust type conversions are provided as trait impls:
+//! The crate adds conversions and helper methods to the generated types:
 //!
-//! - `Timestamp` ↔ [`std::time::SystemTime`] (requires `std` feature)
-//! - `Duration` ↔ [`std::time::Duration`] (requires `std` feature)
-//! - `Timestamp` ↔ [`chrono::DateTime`] (requires `chrono` feature; any time
+//! - `Timestamp` ↔ [`std::time::SystemTime`](https://doc.rust-lang.org/std/time/struct.SystemTime.html) (requires `std` feature)
+//! - `Duration` ↔ [`core::time::Duration`] (also available without `std`)
+//! - `Timestamp` ↔ [`chrono::DateTime`](https://docs.rs/chrono/latest/chrono/struct.DateTime.html) (requires `chrono` feature; any time
 //!   zone in, `Utc` out)
-//! - `Duration` ↔ [`chrono::TimeDelta`] (requires `chrono` feature)
-//! - `Timestamp` ↔ [`jiff::Timestamp`] (requires `jiff` feature)
-//! - `Duration` ↔ [`jiff::SignedDuration`] (requires `jiff` feature)
-//! - `Any::pack` / `Any::unpack` helpers
+//! - `Duration` ↔ [`chrono::TimeDelta`](https://docs.rs/chrono/latest/chrono/struct.TimeDelta.html) (requires `chrono` feature)
+//! - `Timestamp` ↔ [`jiff::Timestamp`](https://docs.rs/jiff/latest/jiff/struct.Timestamp.html) (requires `jiff` feature)
+//! - `Duration` ↔ [`jiff::SignedDuration`](https://docs.rs/jiff/latest/jiff/struct.SignedDuration.html) (requires `jiff` feature)
+//! - [`Any`] packing and unpacking: [`Any::pack_message`],
+//!   [`Any::unpack_message`], [`Any::is_message`]
+//! - [`FieldMask`] path helpers: [`FieldMask::covers`], [`FieldMask::overlaps`],
+//!   [`FieldMask::normalize`], [`FieldMask::union`], [`FieldMask::intersection`]
 //! - `Value` constructors: [`Value::null`](google::protobuf::Value::null), `From<f64>`, `From<String>`, `From<bool>`, etc.
+//! - Collection impls: [`Struct`], [`ListValue`] and [`FieldMask`] each have
+//!   `len`, `is_empty`, `iter`, `IntoIterator`, `FromIterator` and `Extend`.
+//!   `FromIterator` and `Extend` take items that convert into the element:
+//!   `Into<Value>` for [`ListValue`], `Into<String>` for [`FieldMask`], and
+//!   `(K, V)` pairs with `K: Into<String>` and `V: Into<Value>` for
+//!   [`Struct`].
+//!   [`Struct`] iterates through [`StructIter`], [`StructIterMut`] and
+//!   [`StructIntoIter`], in unspecified order.
 //! - Wrapper type `From`/`Into` impls
+//!
+//! # Equality and hashing
+//!
+//! Every well-known type implements `PartialEq`. All but five also implement
+//! `Eq` and `Hash`, so each of them can be a `HashMap` or `HashSet` key. The
+//! five are `DoubleValue`, `FloatValue`, `Value`, `Struct` and `ListValue`,
+//! which contain a floating-point value. `f32` and `f64` are `PartialEq` only,
+//! because NaN differs from itself. `Value` holds an `f64` number, and
+//! `Struct` and `ListValue` hold `Value` messages.
+//!
+//! `==` and `Hash` work field by field, and they include the unknown fields
+//! that decoding preserved. So a message decoded from a peer that sent an
+//! unknown field differs from one built in code with the same field values,
+//! although `Debug` prints the two alike:
+//!
+//! ```rust
+//! use buffa::Message;
+//! use buffa_types::google::protobuf::Timestamp;
+//!
+//! let built = Timestamp::default();
+//! // Field 99 is unknown to `Timestamp`.
+//! let decoded = Timestamp::decode_from_slice(&[0x98, 0x06, 0x07]).unwrap();
+//! assert_eq!(format!("{built:?}"), format!("{decoded:?}"));
+//! assert_ne!(built, decoded);
+//! ```
+//!
+//! Three types compare their fields as stored, which is stricter than what
+//! the value means:
+//!
+//! - [`FieldMask`]: the order of the paths and repeated paths count. Call
+//!   [`FieldMask::normalize`] on both masks first to compare them without
+//!   regard to order, duplicates, and paths that another path covers.
+//! - [`Any`]: `type_url` and the payload bytes are compared, and the payload
+//!   is not decoded. Two encodings of one message differ.
+//! - `Timestamp` and `Duration`: `seconds` and `nanos` are compared without
+//!   normalizing. A value with `nanos` outside its valid range differs from
+//!   the in-range value for the same instant or span.
 //!
 //! # Cargo features
 //!
-//! - **`std`** (default) — standard-library integration (`SystemTime`/`Duration`
+//! - **`std`** (default) — standard-library integration (`SystemTime`
 //!   conversions, `std::error::Error`). Without it the crate is `no_std` + `alloc`.
 //! - **`json`** — proto3 canonical JSON serde for the JSON-mappable WKTs
 //!   (`Timestamp`, `Duration`, `Any`, `Struct`/`Value`/`ListValue`, `FieldMask`,
@@ -76,6 +124,11 @@
 #![cfg_attr(docsrs, feature(doc_cfg))]
 #![deny(rustdoc::broken_intra_doc_links)]
 extern crate alloc;
+
+// Compiles the Rust example in the crate README as a doctest.
+#[cfg(doctest)]
+#[doc = include_str!("../README.md")]
+struct ReadmeDoctests;
 
 // Extension modules (ergonomic helpers — hand-written, not generated).
 mod any_ext;
@@ -192,10 +245,12 @@ pub use google::protobuf::{
     Any, Duration, Empty, FieldMask, ListValue, NullValue, Struct, Timestamp, Value,
 };
 
-// Re-export error types from extension modules (these are hand-written types
-// in private modules, so re-exporting is the only way to make them accessible).
+// Re-export error and iterator types from extension modules (these are
+// hand-written types in private modules, so re-exporting is the only way to
+// make them accessible).
 pub use duration_ext::DurationError;
 pub use timestamp_ext::TimestampError;
+pub use value_ext::{StructIntoIter, StructIter, StructIterMut};
 
 #[cfg(feature = "chrono")]
 #[cfg_attr(docsrs, doc(cfg(feature = "chrono")))]

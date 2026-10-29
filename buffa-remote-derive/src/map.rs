@@ -1,7 +1,8 @@
 use proc_macro2::TokenStream;
 use quote::quote;
-use syn::DeriveInput;
+use syn::{parse_quote, DeriveInput};
 
+use crate::forwarders;
 use crate::remote_field::{self, RemoteField};
 
 pub fn derive(input: DeriveInput) -> syn::Result<TokenStream> {
@@ -27,19 +28,34 @@ pub fn derive(input: DeriveInput) -> syn::Result<TokenStream> {
     let clear_call = remote_field::overridable_call(&overrides, "clear", field_ty, "clear");
     let iter_call = remote_field::overridable_call(&overrides, "iter", field_ty, "iter");
 
+    // `Vec<(Key, Value)>` consumes the same bytes as `HashMap<Key, Value>`:
+    // both collect `Unstructured::arbitrary_iter`.
+    let from_iter = quote! {
+        <Self as ::core::iter::FromIterator<(#key_ty, #value_ty)>>::from_iter(__buffa_seed)
+    };
+    let arbitrary_impl = forwarders::arbitrary(
+        &remote,
+        &quote! { ::buffa::alloc::vec::Vec<(#key_ty, #value_ty)> },
+        &from_iter,
+        forwarders::TakeRest::Seed,
+        &[parse_quote! { Self: ::core::iter::FromIterator<(#key_ty, #value_ty)> }],
+    );
+
+    let serde_impl = forwarders::serde(&remote, forwarders::SerdeForm::Wrapped);
+
     Ok(quote! {
         impl #impl_generics ::buffa::MapStorage for #ident #ty_generics #where_clause {
             type Key = #key_ty;
             type Value = #value_ty;
 
             #[inline]
-            fn storage_len(&self) -> usize {
+            fn storage_len(&self) -> ::core::primitive::usize {
                 #len_call(&#accessor)
             }
 
             #[inline]
-            fn storage_insert(&mut self, key: #key_ty, value: #value_ty) {
-                #insert_call(&mut #accessor, key, value);
+            fn storage_insert(&mut self, __buffa_key: #key_ty, __buffa_value: #value_ty) {
+                #insert_call(&mut #accessor, __buffa_key, __buffa_value);
             }
 
             #[inline]
@@ -48,15 +64,18 @@ pub fn derive(input: DeriveInput) -> syn::Result<TokenStream> {
             }
 
             #[inline]
-            fn storage_iter<'a>(
-                &'a self,
-            ) -> impl ::core::iter::Iterator<Item = (&'a #key_ty, &'a #value_ty)>
+            fn storage_iter<'__buffa_iter>(
+                &'__buffa_iter self,
+            ) -> impl ::core::iter::Iterator<Item = (&'__buffa_iter #key_ty, &'__buffa_iter #value_ty)>
             where
-                #key_ty: 'a,
-                #value_ty: 'a,
+                #key_ty: '__buffa_iter,
+                #value_ty: '__buffa_iter,
             {
                 #iter_call(&#accessor)
             }
         }
+
+        #arbitrary_impl
+        #serde_impl
     })
 }

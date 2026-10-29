@@ -94,7 +94,7 @@ impl Version {
     ///Sets [`Self::suffix`] to `Some(value)`, consuming and returning `self`.
     pub fn with_suffix(
         mut self,
-        value: impl Into<::buffa::alloc::string::String>,
+        value: impl ::core::convert::Into<::buffa::alloc::string::String>,
     ) -> Self {
         self.suffix = Some(value.into());
         self
@@ -279,15 +279,15 @@ impl ::buffa::text::TextFormat for Version {
 }
 #[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for Version {
-    fn serialize_proto_json<S: ::serde::Serializer>(
+    fn serialize_proto_json<__S: ::serde::Serializer>(
         v: &Self,
-        s: S,
-    ) -> ::core::result::Result<S::Ok, S::Error> {
+        s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
         ::serde::Serialize::serialize(v, s)
     }
-    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-        d: D,
-    ) -> ::core::result::Result<Self, D::Error> {
+    fn deserialize_proto_json<'de, __D: ::serde::Deserializer<'de>>(
+        d: __D,
+    ) -> ::core::result::Result<Self, __D::Error> {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
@@ -424,7 +424,7 @@ impl CodeGeneratorRequest {
     ///Sets [`Self::parameter`] to `Some(value)`, consuming and returning `self`.
     pub fn with_parameter(
         mut self,
-        value: impl Into<::buffa::alloc::string::String>,
+        value: impl ::core::convert::Into<::buffa::alloc::string::String>,
     ) -> Self {
         self.parameter = Some(value.into());
         self
@@ -456,9 +456,9 @@ impl ::buffa::Message for CodeGeneratorRequest {
         if let Some(ref v) = self.parameter {
             size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
         }
-        if self.compiler_version.is_set() {
+        if let ::core::option::Option::Some(__v) = self.compiler_version.as_option() {
             let __slot = __cache.reserve();
-            let inner_size = self.compiler_version.compute_size(__cache);
+            let inner_size = __v.compute_size(__cache);
             __cache.set(__slot, inner_size);
             size
                 += 1u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -496,13 +496,13 @@ impl ::buffa::Message for CodeGeneratorRequest {
         if let Some(ref v) = self.parameter {
             ::buffa::types::put_string_field(2u32, v, buf);
         }
-        if self.compiler_version.is_set() {
+        if let ::core::option::Option::Some(__v) = self.compiler_version.as_option() {
             ::buffa::types::put_len_delimited_header(
                 3u32,
                 u64::from(__cache.consume_next()),
                 buf,
             );
-            self.compiler_version.write_to(__cache, buf);
+            __v.write_to(__cache, buf);
         }
         for v in &self.proto_file {
             ::buffa::types::put_len_delimited_header(
@@ -628,9 +628,9 @@ impl ::buffa::text::TextFormat for CodeGeneratorRequest {
             enc.write_field_name("parameter")?;
             enc.write_string(__v)?;
         }
-        if self.compiler_version.is_set() {
+        if let ::core::option::Option::Some(__v) = self.compiler_version.as_option() {
             enc.write_field_name("compiler_version")?;
-            enc.write_message(&*self.compiler_version)?;
+            enc.write_message(__v)?;
         }
         for __v in &self.file_to_generate {
             enc.write_field_name("file_to_generate")?;
@@ -664,7 +664,7 @@ impl ::buffa::text::TextFormat for CodeGeneratorRequest {
                     dec.merge_message(self.compiler_version.get_or_insert_default())?
                 }
                 "file_to_generate" => {
-                    dec.read_repeated_into(
+                    dec.read_repeated_scalar_into(
                         &mut self.file_to_generate,
                         |__d| ::core::result::Result::Ok(__d.read_string()?.into_owned()),
                     )?
@@ -697,15 +697,15 @@ impl ::buffa::text::TextFormat for CodeGeneratorRequest {
 }
 #[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for CodeGeneratorRequest {
-    fn serialize_proto_json<S: ::serde::Serializer>(
+    fn serialize_proto_json<__S: ::serde::Serializer>(
         v: &Self,
-        s: S,
-    ) -> ::core::result::Result<S::Ok, S::Error> {
+        s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
         ::serde::Serialize::serialize(v, s)
     }
-    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-        d: D,
-    ) -> ::core::result::Result<Self, D::Error> {
+    fn deserialize_proto_json<'de, __D: ::serde::Deserializer<'de>>(
+        d: __D,
+    ) -> ::core::result::Result<Self, __D::Error> {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
@@ -829,7 +829,7 @@ impl CodeGeneratorResponse {
     ///Sets [`Self::error`] to `Some(value)`, consuming and returning `self`.
     pub fn with_error(
         mut self,
-        value: impl Into<::buffa::alloc::string::String>,
+        value: impl ::core::convert::Into<::buffa::alloc::string::String>,
     ) -> Self {
         self.error = Some(value.into());
         self
@@ -1086,15 +1086,15 @@ impl ::buffa::text::TextFormat for CodeGeneratorResponse {
 }
 #[cfg(feature = "json")]
 impl ::buffa::json_helpers::ProtoElemJson for CodeGeneratorResponse {
-    fn serialize_proto_json<S: ::serde::Serializer>(
+    fn serialize_proto_json<__S: ::serde::Serializer>(
         v: &Self,
-        s: S,
-    ) -> ::core::result::Result<S::Ok, S::Error> {
+        s: __S,
+    ) -> ::core::result::Result<__S::Ok, __S::Error> {
         ::serde::Serialize::serialize(v, s)
     }
-    fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-        d: D,
-    ) -> ::core::result::Result<Self, D::Error> {
+    fn deserialize_proto_json<'de, __D: ::serde::Deserializer<'de>>(
+        d: __D,
+    ) -> ::core::result::Result<Self, __D::Error> {
         <Self as ::serde::Deserialize>::deserialize(d)
     }
 }
@@ -1145,17 +1145,17 @@ pub mod code_generator_response {
     #[cfg(feature = "json")]
     const _: () = {
         impl ::serde::Serialize for Feature {
-            fn serialize<S: ::serde::Serializer>(
+            fn serialize<__S: ::serde::Serializer>(
                 &self,
-                s: S,
-            ) -> ::core::result::Result<S::Ok, S::Error> {
+                s: __S,
+            ) -> ::core::result::Result<__S::Ok, __S::Error> {
                 s.serialize_str(::buffa::Enumeration::proto_name(self))
             }
         }
         impl<'de> ::serde::Deserialize<'de> for Feature {
-            fn deserialize<D: ::serde::Deserializer<'de>>(
-                d: D,
-            ) -> ::core::result::Result<Self, D::Error> {
+            fn deserialize<__D: ::serde::Deserializer<'de>>(
+                d: __D,
+            ) -> ::core::result::Result<Self, __D::Error> {
                 struct _V;
                 impl ::serde::de::Visitor<'_> for _V {
                     type Value = Feature;
@@ -1169,19 +1169,22 @@ pub mod code_generator_response {
                             ),
                         )
                     }
-                    fn visit_str<E: ::serde::de::Error>(
+                    fn visit_str<__E: ::serde::de::Error>(
                         self,
                         v: &str,
-                    ) -> ::core::result::Result<Feature, E> {
+                    ) -> ::core::result::Result<Feature, __E> {
                         <Feature as ::buffa::Enumeration>::from_proto_name(v)
                             .ok_or_else(|| {
-                                ::serde::de::Error::unknown_variant(v, &[])
+                                ::serde::de::Error::invalid_value(
+                                    ::serde::de::Unexpected::Str(v),
+                                    &"a known enum variant name",
+                                )
                             })
                     }
-                    fn visit_i64<E: ::serde::de::Error>(
+                    fn visit_i64<__E: ::serde::de::Error>(
                         self,
                         v: i64,
-                    ) -> ::core::result::Result<Feature, E> {
+                    ) -> ::core::result::Result<Feature, __E> {
                         let v32 = i32::try_from(v)
                             .map_err(|_| {
                                 ::serde::de::Error::custom(
@@ -1195,10 +1198,10 @@ pub mod code_generator_response {
                                 )
                             })
                     }
-                    fn visit_u64<E: ::serde::de::Error>(
+                    fn visit_u64<__E: ::serde::de::Error>(
                         self,
                         v: u64,
-                    ) -> ::core::result::Result<Feature, E> {
+                    ) -> ::core::result::Result<Feature, __E> {
                         let v32 = i32::try_from(v)
                             .map_err(|_| {
                                 ::serde::de::Error::custom(
@@ -1212,9 +1215,9 @@ pub mod code_generator_response {
                                 )
                             })
                     }
-                    fn visit_unit<E: ::serde::de::Error>(
+                    fn visit_unit<__E: ::serde::de::Error>(
                         self,
-                    ) -> ::core::result::Result<Feature, E> {
+                    ) -> ::core::result::Result<Feature, __E> {
                         ::core::result::Result::Ok(::core::default::Default::default())
                     }
                 }
@@ -1222,15 +1225,15 @@ pub mod code_generator_response {
             }
         }
         impl ::buffa::json_helpers::ProtoElemJson for Feature {
-            fn serialize_proto_json<S: ::serde::Serializer>(
+            fn serialize_proto_json<__S: ::serde::Serializer>(
                 v: &Self,
-                s: S,
-            ) -> ::core::result::Result<S::Ok, S::Error> {
+                s: __S,
+            ) -> ::core::result::Result<__S::Ok, __S::Error> {
                 ::serde::Serialize::serialize(v, s)
             }
-            fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-                d: D,
-            ) -> ::core::result::Result<Self, D::Error> {
+            fn deserialize_proto_json<'de, __D: ::serde::Deserializer<'de>>(
+                d: __D,
+            ) -> ::core::result::Result<Self, __D::Error> {
                 <Self as ::serde::Deserialize>::deserialize(d)
             }
         }
@@ -1404,7 +1407,7 @@ pub mod code_generator_response {
         ///Sets [`Self::name`] to `Some(value)`, consuming and returning `self`.
         pub fn with_name(
             mut self,
-            value: impl Into<::buffa::alloc::string::String>,
+            value: impl ::core::convert::Into<::buffa::alloc::string::String>,
         ) -> Self {
             self.name = Some(value.into());
             self
@@ -1414,7 +1417,7 @@ pub mod code_generator_response {
         ///Sets [`Self::insertion_point`] to `Some(value)`, consuming and returning `self`.
         pub fn with_insertion_point(
             mut self,
-            value: impl Into<::buffa::alloc::string::String>,
+            value: impl ::core::convert::Into<::buffa::alloc::string::String>,
         ) -> Self {
             self.insertion_point = Some(value.into());
             self
@@ -1424,7 +1427,7 @@ pub mod code_generator_response {
         ///Sets [`Self::content`] to `Some(value)`, consuming and returning `self`.
         pub fn with_content(
             mut self,
-            value: impl Into<::buffa::alloc::string::String>,
+            value: impl ::core::convert::Into<::buffa::alloc::string::String>,
         ) -> Self {
             self.content = Some(value.into());
             self
@@ -1459,9 +1462,12 @@ pub mod code_generator_response {
             if let Some(ref v) = self.content {
                 size += 1u64 + ::buffa::types::string_encoded_len(v) as u64;
             }
-            if self.generated_code_info.is_set() {
+            if let ::core::option::Option::Some(__v) = self
+                .generated_code_info
+                .as_option()
+            {
                 let __slot = __cache.reserve();
-                let inner_size = self.generated_code_info.compute_size(__cache);
+                let inner_size = __v.compute_size(__cache);
                 __cache.set(__slot, inner_size);
                 size
                     += 2u64 + ::buffa::encoding::varint_len(inner_size as u64) as u64
@@ -1486,13 +1492,16 @@ pub mod code_generator_response {
             if let Some(ref v) = self.content {
                 ::buffa::types::put_string_field(15u32, v, buf);
             }
-            if self.generated_code_info.is_set() {
+            if let ::core::option::Option::Some(__v) = self
+                .generated_code_info
+                .as_option()
+            {
                 ::buffa::types::put_len_delimited_header(
                     16u32,
                     u64::from(__cache.consume_next()),
                     buf,
                 );
-                self.generated_code_info.write_to(__cache, buf);
+                __v.write_to(__cache, buf);
             }
             self.__buffa_unknown_fields.write_to(buf);
         }
@@ -1598,9 +1607,12 @@ pub mod code_generator_response {
                 enc.write_field_name("content")?;
                 enc.write_string(__v)?;
             }
-            if self.generated_code_info.is_set() {
+            if let ::core::option::Option::Some(__v) = self
+                .generated_code_info
+                .as_option()
+            {
                 enc.write_field_name("generated_code_info")?;
-                enc.write_message(&*self.generated_code_info)?;
+                enc.write_message(__v)?;
             }
             enc.write_unknown_fields(&self.__buffa_unknown_fields)?;
             ::core::result::Result::Ok(())
@@ -1641,15 +1653,15 @@ pub mod code_generator_response {
     }
     #[cfg(feature = "json")]
     impl ::buffa::json_helpers::ProtoElemJson for File {
-        fn serialize_proto_json<S: ::serde::Serializer>(
+        fn serialize_proto_json<__S: ::serde::Serializer>(
             v: &Self,
-            s: S,
-        ) -> ::core::result::Result<S::Ok, S::Error> {
+            s: __S,
+        ) -> ::core::result::Result<__S::Ok, __S::Error> {
             ::serde::Serialize::serialize(v, s)
         }
-        fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-            d: D,
-        ) -> ::core::result::Result<Self, D::Error> {
+        fn deserialize_proto_json<'de, __D: ::serde::Deserializer<'de>>(
+            d: __D,
+        ) -> ::core::result::Result<Self, __D::Error> {
             <Self as ::serde::Deserialize>::deserialize(d)
         }
     }

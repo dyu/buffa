@@ -83,6 +83,102 @@ fn json_scalar_round_trip() {
 }
 
 #[test]
+fn json_bytes_follow_shared_base64_decoder_rules() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Scalars").unwrap();
+
+    let accepted: &[(&str, &[u8])] = &[
+        // One byte: either alphabet, padded or unpadded.
+        ("+w==", &[0xfb]),
+        ("-w==", &[0xfb]),
+        ("+w", &[0xfb]),
+        ("-w", &[0xfb]),
+        // Non-zero trailing bits and a short pad are tolerated.
+        ("Zh==", b"f"),
+        ("Zg=", b"f"),
+        // Two bytes.
+        ("Zm8=", b"fo"),
+        ("Zm8", b"fo"),
+        ("+/8=", &[0xfb, 0xff]),
+        ("-_8", &[0xfb, 0xff]),
+        // Three bytes: a whole group, no padding in either form.
+        ("Zm9v", b"foo"),
+        ("++++", &[0xfb, 0xef, 0xbe]),
+        ("----", &[0xfb, 0xef, 0xbe]),
+        // A whole group followed by a partial one.
+        ("Zm9vYg==", b"foob"),
+        ("Zm9vYg", b"foob"),
+    ];
+    for &(encoded, expected) in accepted {
+        let input = format!(r#"{{"fBytes":"{encoded}"}}"#);
+        let parsed = DynamicMessage::from_json(Arc::clone(&p), idx, &input)
+            .unwrap_or_else(|e| panic!("base64 input {encoded} must be accepted: {e}"));
+        assert_eq!(
+            parsed.field_by_number(15),
+            Some(&Value::Bytes(expected.to_vec())),
+            "decoded bytes for {encoded}"
+        );
+    }
+
+    for (encoded, why) in [
+        ("+_", "both alphabets"),
+        ("/-", "both alphabets"),
+        ("++--", "both alphabets"),
+        ("Zm9v+w-_", "both alphabets"),
+        ("Zg===", "excess padding"),
+        ("Zm8==", "excess padding"),
+        ("Zm9v=", "excess padding"),
+        ("Zm9v==", "excess padding"),
+        ("=", "padding with no data"),
+        ("==", "padding with no data"),
+        ("====", "padding with no data"),
+        ("Zg==Zg==", "padding before the end"),
+        ("Zm9vZ", "lone trailing character"),
+        ("Zm 9v", "character outside both alphabets"),
+    ] {
+        let input = format!(r#"{{"fBytes":"{encoded}"}}"#);
+        assert!(
+            DynamicMessage::from_json(Arc::clone(&p), idx, &input).is_err(),
+            "base64 input {encoded} must be rejected: {why}"
+        );
+    }
+}
+
+#[test]
+fn json_bytes_serialize_as_standard_padded_base64() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Scalars").unwrap();
+    let md = p.message_by_name("reflect.test.Scalars").unwrap();
+
+    let cases: &[(&[u8], &str)] = &[
+        (b"f", "Zg=="),
+        (b"fo", "Zm8="),
+        (b"foo", "Zm9v"),
+        (b"foob", "Zm9vYg=="),
+        // Sextets 62 and 63 are `+` and `/`, not the URL-safe `-` and `_`.
+        (&[0xfb, 0xff], "+/8="),
+        (&[0xfb, 0xef, 0xbe], "++++"),
+        (&[0xff, 0xff, 0xff], "////"),
+    ];
+    for &(bytes, encoded) in cases {
+        let mut msg = DynamicMessage::new(Arc::clone(&p), idx);
+        msg.set(md.field(15).unwrap(), Value::Bytes(bytes.to_vec()));
+        let json = msg.to_json().unwrap();
+        assert_eq!(json, format!(r#"{{"fBytes":"{encoded}"}}"#));
+        let parsed = DynamicMessage::from_json(Arc::clone(&p), idx, &json).unwrap();
+        assert_eq!(parsed, msg, "round trip of {encoded}");
+    }
+
+    // An empty value is the proto3 default: left out on output, accepted as
+    // `""` on input.
+    let empty = DynamicMessage::new(Arc::clone(&p), idx);
+    assert_eq!(empty.to_json().unwrap(), "{}");
+    let parsed = DynamicMessage::from_json(Arc::clone(&p), idx, r#"{"fBytes":""}"#).unwrap();
+    assert_eq!(parsed.field_by_number(15), Some(&Value::Bytes(Vec::new())));
+    assert_eq!(parsed.to_json().unwrap(), "{}");
+}
+
+#[test]
 fn json_integer_parsing_matches_generated_messages() {
     let p = pool();
     let idx = p.message_index("reflect.test.Scalars").unwrap();
@@ -130,6 +226,37 @@ fn json_integer_parsing_matches_generated_messages() {
             "rejection should name the offending value, got: {err}"
         );
     }
+}
+
+#[test]
+fn json_quoted_integers_accept_large_rescaled_significands() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Scalars").unwrap();
+    let zeros = "0".repeat(80);
+    let parsed = DynamicMessage::from_json(
+        Arc::clone(&p),
+        idx,
+        &format!(
+            r#"{{
+                "fInt32": "{}{zeros}e-80",
+                "fInt64": "{}{zeros}.000e-80",
+                "fUint32": "{}{zeros}E-80",
+                "fUint64": "{}{zeros}e-80"
+            }}"#,
+            i32::MIN,
+            i64::MIN,
+            u32::MAX,
+            u64::MAX
+        ),
+    )
+    .expect("large significands that rescale into range must parse exactly");
+    assert_eq!(parsed.field_by_number(3), Some(&Value::I32(i32::MIN)));
+    assert_eq!(parsed.field_by_number(4), Some(&Value::I64(i64::MIN)));
+    assert_eq!(parsed.field_by_number(5), Some(&Value::U32(u32::MAX)));
+    assert_eq!(parsed.field_by_number(6), Some(&Value::U64(u64::MAX)));
+    let canonical = parsed.to_json().unwrap();
+    let reparsed = DynamicMessage::from_json(p, idx, &canonical).unwrap();
+    assert_eq!(reparsed, parsed);
 }
 
 /// The quoted-string path covers the full range exactly and rejects the
@@ -184,6 +311,24 @@ fn json_quoted_integer_bounds_match_generated_messages() {
             "rejection should name the offending value for {input}, got: {err}"
         );
     }
+}
+
+/// An unquoted `float` reaches the reflective parser as an `f64` and is
+/// narrowed, as in generated code, so a decimal next to an `f32` midpoint
+/// decodes differently from the same decimal quoted (#647).
+#[test]
+fn json_unquoted_float_rounds_through_f64_as_generated_messages_do() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Scalars").unwrap();
+    let parse = |json: &str| {
+        let msg = DynamicMessage::from_json(Arc::clone(&p), idx, json).expect("float parses");
+        match msg.field_by_number(2) {
+            Some(Value::F32(f)) => f.to_bits(),
+            other => panic!("expected F32, got {other:?}"),
+        }
+    };
+    assert_eq!(parse(r#"{"fFloat": 1.0000000596046448}"#), 0x3f80_0000);
+    assert_eq!(parse(r#"{"fFloat": "1.0000000596046448"}"#), 0x3f80_0001);
 }
 
 /// Quoted floats go through the same `json_helpers` modules as generated
@@ -262,6 +407,29 @@ fn json_containers_round_trip() {
 
     let parsed = DynamicMessage::from_json(Arc::clone(&p), containers_idx, &json).unwrap();
     assert_eq!(msg, parsed);
+}
+
+#[test]
+fn json_map_duplicate_keys_keep_last_value() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Containers").unwrap();
+    let msg = DynamicMessage::from_json(
+        p,
+        idx,
+        r#"{"tags":{"b":1,"a":2,"b":3,"a":4,"b":5,"a":6,"b":7}}"#,
+    )
+    .unwrap();
+    let Some(Value::Map(tags)) = msg.field_by_number(3) else {
+        panic!("tags must be a map");
+    };
+    assert_eq!(
+        tags.entries(),
+        &[
+            (MapKey::String("a".into()), Value::I32(6)),
+            (MapKey::String("b".into()), Value::I32(7)),
+        ]
+    );
+    assert_eq!(msg.to_json().unwrap(), r#"{"tags":{"a":6,"b":7}}"#);
 }
 
 #[test]
@@ -376,4 +544,168 @@ fn json_lenient_mode_propagates_to_map_values() {
         panic!("map field not set");
     };
     assert_eq!(entries.len(), 1);
+}
+
+/// The `float` text the two paths must agree on: `(value, canonical form)`.
+///
+/// The canonical form is the shortest decimal that round-trips as an **`f32`**,
+/// which is what the shared `json_helpers::float` serializer produces (asserted
+/// case by case below, so a change there shows up here too). Each case is one
+/// where the widened `f64` spelling differs: `0.1`/`1.6` gain the `f64` tail
+/// digits, `f32::MAX` changes both digits and exponent form, `1e-45` (the
+/// smallest subnormal) and the integral value differ in digits an `f32` cannot
+/// represent at all.
+const FLOAT_CASES: &[(f32, &str)] = &[
+    (0.1, "0.1"),
+    (1.6, "1.6"),
+    (f32::MAX, "3.4028235e+38"),
+    (f32::MIN, "-3.4028235e+38"),
+    (1e-45, "1e-45"),
+    (1079984100.0, "1079984100.0"),
+];
+
+/// The typed path's `float` serialization is codegen's
+/// `#[serde(with = "::buffa::json_helpers::float")]` on the generated field
+/// (`buffa-codegen/src/message.rs`, `buffa-codegen/src/oneof.rs`), which
+/// lowers to exactly this call. `buffa-types`' `FloatValue` wrapper
+/// (`wrapper_ext.rs`) is the same function on the same serializer.
+fn typed_float_text(value: f32) -> String {
+    struct TypedFloat(f32);
+
+    impl serde::Serialize for TypedFloat {
+        fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+            buffa::json_helpers::float::serialize(&self.0, s)
+        }
+    }
+
+    serde_json::to_string(&TypedFloat(value)).expect("f32 always serializes")
+}
+
+fn scalars_with_float(pool: &Arc<DescriptorPool>, value: f32) -> DynamicMessage {
+    let idx = pool.message_index("reflect.test.Scalars").unwrap();
+    let md = pool.message_by_name("reflect.test.Scalars").unwrap();
+    let mut msg = DynamicMessage::new(Arc::clone(pool), idx);
+    // `f_float` is a plain proto3 `float` field (field 2), not a wrapper.
+    msg.set(md.field(2).unwrap(), Value::F32(value));
+    msg
+}
+
+/// A `float` field must print the same text whether the message is typed or
+/// dynamic: the widened `f64` spelling is a different value's text, and
+/// consumers that compare or cache JSON (ETags, canonical-form hashes, golden
+/// fixtures) see two documents for one message.
+#[test]
+fn json_float_text_matches_typed_path() {
+    let p = pool();
+
+    for (value, canonical) in FLOAT_CASES {
+        assert_eq!(
+            typed_float_text(*value),
+            *canonical,
+            "expectation drift: the typed path no longer prints {canonical:?} for {value}"
+        );
+        assert_eq!(
+            scalars_with_float(&p, *value).to_json().unwrap(),
+            format!(r#"{{"fFloat":{canonical}}}"#),
+            "reflective text for {value} must be the canonical f32-precision form"
+        );
+    }
+}
+
+/// The reflective decoder has to read what the encoder side writes — its own
+/// output and, since the two paths now agree on text, the canonical form the
+/// typed path emits. Both directions go through the shared `json_helpers`
+/// range rule, so an in-range value near `f32::MAX` is never rejected.
+#[test]
+fn json_float_round_trips_and_reads_canonical_text() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Scalars").unwrap();
+
+    for (value, canonical) in FLOAT_CASES {
+        let written = scalars_with_float(&p, *value).to_json().unwrap();
+        let parsed = DynamicMessage::from_json(Arc::clone(&p), idx, &written)
+            .unwrap_or_else(|e| panic!("reflective parse of its own output {written} failed: {e}"));
+        assert_eq!(
+            parsed.field_by_number(2),
+            Some(&Value::F32(*value)),
+            "reflective round trip of {value} changed the value"
+        );
+
+        let canonical_input = format!(r#"{{"fFloat":{canonical}}}"#);
+        let read = DynamicMessage::from_json(Arc::clone(&p), idx, &canonical_input)
+            .unwrap_or_else(|e| panic!("canonical text {canonical_input} must parse: {e}"));
+        assert_eq!(
+            read.field_by_number(2),
+            Some(&Value::F32(*value)),
+            "canonical text {canonical_input} must read back as {value}"
+        );
+    }
+
+    // Sharing the helper's range rule must not turn overflow into saturation:
+    // past the point where narrowing to `f32` yields infinity it is still an
+    // error, exactly as on the typed path.
+    for input in [r#"{"fFloat": 3.5e38}"#, r#"{"fFloat": -3.5e38}"#] {
+        let err = DynamicMessage::from_json(Arc::clone(&p), idx, input)
+            .expect_err("out-of-range unquoted float must be rejected");
+        assert!(
+            err.to_string().contains("invalid value"),
+            "rejection should name the offending value for {input}, got: {err}"
+        );
+    }
+}
+
+/// The proto3 JSON special tokens are unchanged by routing `float` through the
+/// shared helper: `NaN` / `Infinity` / `-Infinity` stay strings on the way out
+/// and re-parse to the same non-finite value.
+#[test]
+fn json_float_special_values_keep_the_protojson_tokens() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Scalars").unwrap();
+
+    for (value, text) in [
+        (f32::NAN, r#"{"fFloat":"NaN"}"#),
+        (f32::INFINITY, r#"{"fFloat":"Infinity"}"#),
+        (f32::NEG_INFINITY, r#"{"fFloat":"-Infinity"}"#),
+    ] {
+        let written = scalars_with_float(&p, value).to_json().unwrap();
+        assert_eq!(written, text, "special-value text for {value}");
+        let parsed = DynamicMessage::from_json(Arc::clone(&p), idx, text)
+            .unwrap_or_else(|e| panic!("{text} must parse: {e}"));
+        assert_eq!(parsed.to_json().unwrap(), text, "re-write of {text}");
+    }
+}
+
+/// `double` keeps its own `f64`-precision text: the fix is `f32`-specific, so
+/// the shared `float` helper must not be applied to the `double` branch.
+#[test]
+fn json_double_text_is_f64_precision() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Scalars").unwrap();
+    let md = p.message_by_name("reflect.test.Scalars").unwrap();
+    let mut msg = DynamicMessage::new(Arc::clone(&p), idx);
+    // `f_double` is field 1.
+    msg.set(md.field(1).unwrap(), Value::F64(0.1));
+    assert_eq!(msg.to_json().unwrap(), r#"{"fDouble":0.1}"#);
+}
+
+#[test]
+fn json_unknown_enum_name_error_names_the_value() {
+    let p = pool();
+    let idx = p.message_index("reflect.test.Containers").unwrap();
+    let err = DynamicMessage::from_json(p, idx, r#"{"color": "PURPLE"}"#).unwrap_err();
+    assert!(
+        err.to_string()
+            .contains(r#"invalid value: string "PURPLE", expected a known enum variant name"#),
+        "got: {err}"
+    );
+}
+
+#[test]
+fn generated_enum_unknown_name_error_names_the_value() {
+    use buffa_descriptor::generated::descriptor::Edition;
+    let err = serde_json::from_str::<Edition>(r#""PURPLE""#).unwrap_err();
+    assert_eq!(
+        err.to_string(),
+        r#"invalid value: string "PURPLE", expected a known enum variant name at line 1 column 8"#
+    );
 }

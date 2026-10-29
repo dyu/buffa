@@ -43,9 +43,11 @@ pub(crate) mod owned_view;
 pub(crate) mod reflect;
 pub(crate) mod reflect_owned;
 pub(crate) mod reflect_view;
+pub(crate) mod table_codec;
+pub(crate) mod table_plan;
 pub(crate) mod view;
 
-use crate::generated::descriptor::{DescriptorProto, FileDescriptorProto};
+use crate::generated::descriptor::{DescriptorProto, EnumDescriptorProto, FileDescriptorProto};
 use proc_macro2::TokenStream;
 use quote::{format_ident, quote};
 
@@ -468,9 +470,9 @@ pub(crate) fn parse_custom_list_path(
 ///
 /// Select a representation through `buffa_build`'s `string_type` /
 /// `string_type_custom` builder methods. The wire format is identical regardless
-/// of representation — only the in-memory owned type changes; view types keep
-/// borrowing `&str`, and `map<_, string>` / `map<string, _>` keys and values
-/// always stay `String`.
+/// of representation — only the in-memory owned type changes, and view types
+/// keep borrowing `&str`. A rule that matches a `map` field applies to its
+/// `string` key and its `string` value.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum StringRepr {
@@ -483,10 +485,17 @@ pub enum StringRepr {
     ///
     /// # Limitations
     ///
-    /// - A *foreign* custom type used as a `repeated` element fails to compile
-    ///   (the emitted `ReflectElement` impl violates the orphan rule). Wrap it
-    ///   in a crate-local newtype for that case; singular / optional / oneof /
-    ///   map uses work with a foreign type directly.
+    /// - With `generate_reflection_vtable`, a *foreign* custom type used as a
+    ///   `repeated` element or as a `map` key or value fails to compile (the
+    ///   emitted `ReflectElement` / `ReflectMapKey` impl violates the orphan
+    ///   rule). Wrap it in a crate-local newtype for those cases; singular /
+    ///   optional / oneof uses work with a foreign type directly.
+    /// - A custom type used as a `map` key must implement `Hash + Eq` for
+    ///   [`MapRepr::HashMap`], or `Ord` for [`MapRepr::BTreeMap`].
+    /// - With `generate_json`, a custom type on an `optional`, `repeated` or
+    ///   oneof field, or used as a `map` key or value, must implement
+    ///   `serde::Serialize` and `serde::Deserialize`. A singular field without
+    ///   `optional` needs no `serde` impl.
     /// - A path that does not parse as a Rust type surfaces as
     ///   [`CodeGenError::InvalidTypePath`] at generation (`.compile()`) time.
     /// - The per-element impls are deduplicated within a single generation, but
@@ -540,8 +549,11 @@ impl StringRepr {
 /// Select a representation through `buffa_build`'s `bytes_type` /
 /// `bytes_type_custom` builder methods (or the legacy `use_bytes_type`, which
 /// selects [`Bytes`](BytesRepr::Bytes)). The wire format is identical regardless
-/// of representation; view types keep borrowing `&[u8]`, and `map` bytes values
-/// follow the same rules as the string path.
+/// of representation, and view types keep borrowing `&[u8]`. A rule that
+/// matches a `map` field applies to its `bytes` value. One map shape keeps
+/// `Vec<u8>` values whatever rule matches: a map whose `string` key is mapped
+/// to `bytes` by [`strict_utf8_mapping`](CodeGenConfig::strict_utf8_mapping)
+/// (`utf8_validation = NONE` on the key) and whose value is `bytes`.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 #[non_exhaustive]
 pub enum BytesRepr {
@@ -560,9 +572,11 @@ pub enum BytesRepr {
     ///   (the emitted `ReflectElement` / `ProtoElemJson` impls violate the
     ///   orphan rule). Wrap it in a crate-local newtype for that case; singular
     ///   / optional / oneof uses work with a foreign type directly.
-    /// - A `Custom` rule does **not** apply to `map<K, bytes>` values — they
-    ///   stay `Vec<u8>`. Only the built-in [`Bytes`](BytesRepr::Bytes) applies
-    ///   to map values.
+    /// - A `Custom` rule applies to `map<K, bytes>` values, as
+    ///   [`Bytes`](BytesRepr::Bytes) does. With `generate_json` or
+    ///   `generate_reflection_vtable`, codegen emits `ProtoElemJson` /
+    ///   `ReflectElement` impls for the value type, so it must be a
+    ///   crate-local type.
     /// - A path that does not parse as a Rust type surfaces as
     ///   [`CodeGenError::InvalidTypePath`] at generation (`.compile()`) time.
     /// - The per-element impls are deduplicated within a single generation, but
@@ -704,7 +718,8 @@ impl MapRepr {
 /// The owned smart pointer a singular message field's `buffa::MessageField`
 /// wraps in generated owned structs.
 ///
-/// The default is [`Box`](PointerRepr::Box). [`Custom`](PointerRepr::Custom)
+/// The default is [`Inline`](PointerRepr::Inline); it was `Box` before 0.9.
+/// [`Custom`](PointerRepr::Custom)
 /// substitutes any pointer that satisfies the `buffa::ProtoBox<T>` bound — for
 /// example a `smallbox`-style pointer that stores small messages inline.
 /// Because the pointer *wraps* the message type, its path is a **template**
@@ -1056,6 +1071,105 @@ pub enum EnumTypeOverride {
     Open,
 }
 
+/// How a message's binary [`Message`](https://docs.rs/buffa/latest/buffa/trait.Message.html)
+/// implementation is generated. Select it with
+/// [`CodeGenConfig::codec_strategy`] and [`CodeGenConfig::codec_strategy_in`].
+///
+/// The strategy changes only the code that sizes, writes and decodes a message
+/// in the binary wire format. It never changes the wire format, and JSON, text,
+/// view and reflection code are generated the same way under either.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum CodecStrategy {
+    /// Emit code specialised to each message: the fastest code, and the
+    /// largest. The default.
+    #[default]
+    Unrolled,
+    /// Emit one static table per message and forward `Message` to interpreters
+    /// shared by every message, in the `buffa` crate. On a large schema it
+    /// makes the compiled code about 40% smaller at `opt-level = "z"`; a
+    /// message that cannot use it keeps its size. It costs run time on messages
+    /// made of many small fields. The guide's "Smaller generated code" section
+    /// has the measurements.
+    ///
+    /// Not every message can use it. These stay [`Unrolled`](Self::Unrolled):
+    ///
+    /// - a message with a group field;
+    /// - the message type of a group field;
+    /// - a message that uses the `MessageSet` wire format;
+    /// - a message with extension ranges, when JSON code is generated and
+    ///   unknown fields are preserved;
+    /// - a message with a `map` field, when `map_entries_omit_defaults` is
+    ///   set: the table writes both fields of every entry;
+    /// - a message with a field of a non-default string, bytes, or collection
+    ///   type, such as `use_bytes_type`, `string_type`, `bytes_type`,
+    ///   `repeated_type`, and a custom `map_type` select. `HashMap` and
+    ///   `BTreeMap` maps are supported; a `map` whose keys or values are of a
+    ///   non-default string or bytes type is not;
+    /// - a message that holds, in a singular, repeated, `oneof`, or map value
+    ///   field, a message of the same run that has a `bytes` field of a
+    ///   non-default type, or that holds one. The table decodes from one
+    ///   contiguous slice, so it would copy `bytes::Bytes` fields that
+    ///   unrolled code decoding from a `Bytes` shares with the input.
+    ///
+    /// A table message may hold any other message, including as a member of a
+    /// `oneof` and as a `map` value. It reaches a child that is a table
+    /// message through the child's table, and any other child, whether it is
+    /// [`Unrolled`](Self::Unrolled), generated by another crate, or a
+    /// well-known type, through the child's `Message` impl, which costs a
+    /// function call per child. Selecting a message does not select the
+    /// messages it holds, and keeping a child [`Unrolled`](Self::Unrolled) does
+    /// not keep the messages that hold it unrolled: to keep a whole path
+    /// specialised, set its holders to `Unrolled` too.
+    ///
+    /// A table message differs from an unrolled one in these ways. A field that
+    /// declares a length past the end of its enclosing message fails at once
+    /// with `DecodeError::UnexpectedEof`, where unrolled code can report a
+    /// different error for the same rejected input; a child reached through its
+    /// `Message` impl is read from the slice of the nearest enclosing table
+    /// message, so it is bounded there. `clear()` resets the message to its
+    /// default, which releases the capacity of its strings, vectors and maps,
+    /// where unrolled code keeps it.
+    /// Decoding gathers a `Buf` that is not contiguous into one buffer first.
+    /// Encoding into any sink other than the cursor that `Message::encode` and
+    /// its siblings write a `BufMut` through, meaning a `Rope`, a sink defined
+    /// outside `buffa`, or a `BufMut` passed straight to `Message::write_to`,
+    /// stages each child reached through its `Message` impl in a scratch
+    /// buffer, and a `Rope` copies it again and cannot share the `bytes`
+    /// fields inside it by reference count. Codegen cannot see the fields of a
+    /// message from another crate, so a table message that holds one with a
+    /// `bytes` field of a non-default type copies it on decode. The well-known
+    /// type `google.protobuf.Any` is one, because its `value` is
+    /// `bytes::Bytes`. To keep the payload shared with a `Bytes` input, set the
+    /// holder to [`Unrolled`](Self::Unrolled) with `codec_strategy_in`.
+    ///
+    /// A message that another crate or codegen run uses as the type of a group
+    /// or editions `DELIMITED` field must not be selected, because
+    /// `Message::merge_field` on a table message cannot gather a
+    /// non-contiguous buffer, and the default group decoding calls it. Codegen
+    /// sees only the group fields of its own run.
+    ///
+    /// Codegen reports the messages that fall back in one
+    /// [`CodeGenWarning::TableCodecFallbackSummary`]. The table code needs Rust
+    /// 1.77 or later, and contains `unsafe` code inside `buffa` macros, so it
+    /// compiles under `#![forbid(unsafe_code)]`.
+    Table,
+}
+
+/// Why some messages selected for [`CodecStrategy::Table`] fell back to
+/// [`CodecStrategy::Unrolled`], for
+/// [`CodeGenWarning::TableCodecFallbackSummary`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TableCodecFallbackReason {
+    /// The reason as a predicate, such as `has a group field`. The wording is for
+    /// people and may change between releases.
+    pub reason: String,
+    /// The proto paths of all of them, with a leading dot, in declaration
+    /// order.
+    pub messages: Vec<String>,
+}
+
 /// Configuration for code generation.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -1172,7 +1286,9 @@ pub struct CodeGenConfig {
     /// JSON field (proto3 JSON inline oneof encoding).
     pub generate_json: bool,
     /// Whether to emit `#[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]`
-    /// on generated message structs and enum types.
+    /// on generated message structs and enum types. An enum with a
+    /// `[deprecated = true]` variant gets a generated impl under the same
+    /// `cfg` instead, because the derive would warn on that variant.
     ///
     /// When this is `true`, the downstream crate must add `arbitrary` as an
     /// optional dependency and enable the `buffa/arbitrary` feature. The
@@ -1180,14 +1296,34 @@ pub struct CodeGenConfig {
     /// exactly `"arbitrary"` — the generated `cfg_attr` uses that literal
     /// string and cannot be customized. This applies to both the struct-level
     /// `derive(Arbitrary)` and the per-field `#[arbitrary(with = ...)]`
-    /// attributes emitted for `bytes_fields`-typed fields.
+    /// attributes described below.
     ///
-    /// For `bytes_fields`-typed fields, codegen emits `#[arbitrary(with = ...)]`
-    /// using helpers in `::buffa::__private` since `bytes::Bytes` has no
-    /// `Arbitrary` impl. Singular, optional, and repeated bytes fields are all
-    /// covered. Map values are always `Vec<u8>` regardless of `bytes_fields`
-    /// and require no special handling.
+    /// For a field whose `bytes_fields` or `string_fields` rule selects a
+    /// non-default type, codegen emits `#[arbitrary(with = ...)]` using
+    /// helpers in `::buffa::__private`, so the substituted type needs no
+    /// `Arbitrary` impl. This covers singular, optional, repeated and oneof
+    /// fields, and the key and value of a `map` field.
     pub generate_arbitrary: bool,
+    /// Proto paths of the messages and enums whose generated `Debug`
+    /// implementation is omitted, so that the consuming crate can write its
+    /// own.
+    ///
+    /// For messages a rule is a proto-segment-aware prefix: `".pkg.Msg"`
+    /// matches that message and the messages nested inside it, `".pkg"`
+    /// matches every message in the package and its sub-packages, and `"."`
+    /// matches every message. The oneof enums of a matched message lose
+    /// their `Debug` with it. An enum loses its `Debug` only when a rule is
+    /// its exact name, such as `".pkg.Level"`. View types keep theirs.
+    ///
+    /// A matched enum does not compile until the crate implements `Debug`
+    /// for it, because `buffa::Enumeration` requires `Debug`. A matched
+    /// message needs an impl when an unmatched message or oneof holds it,
+    /// because their generated `Debug` formats it, and whenever reflection
+    /// is generated, because `ReflectElement` requires `Debug`.
+    ///
+    /// A rule that matches no generated message and names no generated enum
+    /// produces [`CodeGenWarning::SkipDebugRuleMatchedNothing`].
+    pub skip_debug: Vec<String>,
     /// External type path mappings.
     ///
     /// Each entry maps either a fully-qualified protobuf package prefix
@@ -1199,6 +1335,14 @@ pub struct CodeGenConfig {
     /// compiled once in a dedicated crate and referenced from others. An
     /// exact type-FQN entry wins over a covering package prefix; otherwise
     /// the longest matching prefix wins.
+    ///
+    /// The proto side must be `"."` (every type) or a fully-qualified name:
+    /// a leading dot, then protobuf identifiers separated by single dots,
+    /// with no trailing dot. [`generate`] does not validate entries, and an
+    /// entry in another form matches no type; a caller that fills this field
+    /// directly should pass each name through
+    /// [`normalize_extern_path_proto_name`], as `protoc-gen-buffa` and
+    /// `buffa-build` do.
     ///
     /// Well-known types (`google.protobuf.*`) are automatically mapped to
     /// `::buffa_types::google::protobuf::*` without needing an explicit
@@ -1216,8 +1360,14 @@ pub struct CodeGenConfig {
     /// Ordered (proto-path-prefix, [`BytesRepr`]) rules selecting the Rust type
     /// for `bytes` fields. Later rules win, so a broad rule (e.g. `"."` →
     /// `Bytes`) can be refined by a more specific one. Fields matching no rule
-    /// use `Vec<u8>`. The path is matched with the same proto-segment-aware
-    /// prefix logic as [`string_fields`](Self::string_fields).
+    /// use `Vec<u8>`.
+    ///
+    /// A rule is a prefix of a fully-qualified field path, matched on whole
+    /// path segments, and starts with a dot: `".my.pkg.Msg.data"`,
+    /// `".my.pkg.Msg"`, `".my.pkg"`, or `"."` for every field. Codegen does
+    /// not add the dot (`buffa-build` does), and a path without it matches no
+    /// field. A rule that does not match a field of a generated message
+    /// produces [`CodeGenWarning::FieldTypeRuleMatchedNothing`].
     pub bytes_fields: Vec<(String, BytesRepr)>,
     /// Ordered (proto-path-prefix, [`StringRepr`]) rules selecting the Rust type
     /// for `string` fields. Later rules win, so a broad rule (e.g. `"."` →
@@ -1226,9 +1376,11 @@ pub struct CodeGenConfig {
     /// `String`. The path is matched with the same proto-segment-aware prefix
     /// logic as [`bytes_fields`](Self::bytes_fields).
     ///
-    /// Applies to singular, optional, and repeated `string` fields and oneof
-    /// `string` variants. Map keys and values always stay `String`, mirroring
-    /// the bytes path (where map values always stay `Vec<u8>`).
+    /// Applies to singular, optional, and repeated `string` fields, oneof
+    /// `string` variants, and the `string` keys and values of `map` fields
+    /// (matched by the map field's path). A rule that does not match a field
+    /// of a generated message produces
+    /// [`CodeGenWarning::FieldTypeRuleMatchedNothing`].
     pub string_fields: Vec<(String, StringRepr)>,
     /// Ordered (proto-path-prefix, [`MapRepr`]) rules selecting the owned Rust
     /// map collection for `map` fields. Later rules win, with the same
@@ -1237,7 +1389,9 @@ pub struct CodeGenConfig {
     ///
     /// Independent of the element/value representation: a `map` field's key and
     /// value types are chosen by the usual scalar/string/bytes/message rules,
-    /// and this knob only changes the surrounding collection.
+    /// and this option changes only the surrounding collection. A rule that
+    /// does not match a field of a generated message produces
+    /// [`CodeGenWarning::FieldTypeRuleMatchedNothing`].
     pub map_fields: Vec<(String, MapRepr)>,
     /// Ordered (proto-path-prefix, [`PointerRepr`]) rules selecting the owned
     /// smart pointer for singular message fields (the pointer inside
@@ -1256,7 +1410,8 @@ pub struct CodeGenConfig {
     /// Applies only to `repeated` fields (not `map`, whose collection stays
     /// the configured map type). The element type is chosen by the usual
     /// scalar/string/bytes/message rules and substituted into the collection
-    /// template.
+    /// template. A rule that does not match a field of a generated message
+    /// produces [`CodeGenWarning::FieldTypeRuleMatchedNothing`].
     pub repeated_fields: Vec<(String, RepeatedRepr)>,
     /// Path-scoped editions feature overrides, applied by mutating the parsed
     /// descriptors before generation.
@@ -1357,14 +1512,28 @@ pub struct CodeGenConfig {
     /// Each entry is `(proto_path, attribute)`. The `proto_path` is matched
     /// as a prefix against the fully-qualified proto name: `"."` applies to
     /// all types, `".my.pkg"` to types in that package, `".my.pkg.MyMessage"`
-    /// to a specific type. The `attribute` is a raw Rust attribute string
-    /// (e.g., `"#[derive(serde::Serialize)]"`).
+    /// to a specific type. The `attribute` is one or more outer Rust
+    /// attributes, each written with its `#[...]` (e.g.,
+    /// `"#[derive(serde::Serialize)]"`). [`generate`] returns
+    /// [`CodeGenError::InvalidCustomAttribute`] for any other string, an
+    /// empty one included. The same rule holds for the five attribute lists
+    /// below.
+    ///
+    /// When using a custom `serde::Serialize` derive, follow the requirements
+    /// documented by `buffa_build::Config::type_attribute`: disable
+    /// unknown-field preservation for generated messages and enable the
+    /// `json` feature for buffa's `EnumValue` and `MessageField` serde
+    /// implementations. Do not combine a custom derive with generated JSON
+    /// implementations.
     pub type_attributes: Vec<(String, String)>,
     /// Custom attributes to inject on generated struct fields.
     ///
     /// Each entry is `(proto_path, attribute)`. The `proto_path` is matched
     /// as a prefix against the fully-qualified field path (e.g.,
-    /// `".my.pkg.MyMessage.my_field"`). `"."` applies to all fields.
+    /// `".my.pkg.MyMessage.my_field"`). `"."` applies to all fields. Oneof
+    /// variants are matched as `".my.pkg.MyMessage.my_oneof.variant"`; the
+    /// struct field holding the oneof is not reached, see
+    /// `oneof_struct_field_attributes`.
     pub field_attributes: Vec<(String, String)>,
     /// Custom attributes to inject on generated message structs only (not enums).
     ///
@@ -1385,10 +1554,24 @@ pub struct CodeGenConfig {
     /// Same path-matching semantics as `type_attributes`, matched against the
     /// oneof's fully-qualified path (`.pkg.Message.oneof_name`). Useful when a
     /// oneof needs a different attribute set than the surrounding types — e.g.
-    /// keeping `#[derive(serde::Serialize)]` on messages and oneofs while a
-    /// separate `enum_attributes` entry puts a different serde derive on the
-    /// regular enums.
+    /// applying `#[derive(serde::Serialize)]` to oneofs while a separate
+    /// `enum_attributes` entry puts a different serde derive on the regular
+    /// enums. When the surrounding messages use the same custom derive, follow
+    /// the `buffa_build::Config::type_attribute` requirements for unknown
+    /// fields and the `json` feature.
     pub oneof_attributes: Vec<(String, String)>,
+    /// Custom attributes to inject on a message struct's field holding a
+    /// oneof (the `Option<OneofEnum>` member), not on the oneof's variants or
+    /// the oneof enum.
+    ///
+    /// Same path-matching semantics as `type_attributes`, matched against the
+    /// oneof's fully-qualified path (`.pkg.Message.oneof_name`).
+    /// `field_attributes` never reaches this field: on the oneof's path it
+    /// matches only the variants (`.pkg.Message.oneof_name.variant`).
+    ///
+    /// Applies to the owned message struct only; the view structs do not get
+    /// the attribute.
+    pub oneof_struct_field_attributes: Vec<(String, String)>,
     /// Wrap generated `impl`s in `#[cfg(feature = "...")]` instead of
     /// emitting them unconditionally.
     ///
@@ -1455,6 +1638,27 @@ pub struct CodeGenConfig {
     ///
     /// Defaults to `true`.
     pub generate_with_setters: bool,
+    /// Encode map entries as prost does: leave an entry's key or value out
+    /// when it holds what a missing field decodes to, and a message value when
+    /// it encodes to nothing.
+    ///
+    /// Off, every entry carries both fields, as the C++ and Java runtimes
+    /// write them. Decoding reads either; a `-0.0` float value is left out
+    /// and so decodes as `0.0`. prost leaves out a message value equal to its
+    /// default, so a value that still encodes a field, such as one with a
+    /// `required` field at its default, is written here and not by prost.
+    ///
+    /// Applies to the owned, view and lazy view encoders of the messages
+    /// generated in this run: types generated without it, the well-known
+    /// types and `DynamicMessage` write both fields. With
+    /// [`CodecStrategy::Table`], messages with a map field keep the unrolled
+    /// codec, and a [`codec_strategy_in`](Self::codec_strategy_in) rule that
+    /// selects the table for such a message by its exact path is a
+    /// [`CodeGenError`]. `buffa_build::Config::map_entries_omit_defaults` has
+    /// the details.
+    ///
+    /// Defaults to `false`.
+    pub map_entries_omit_defaults: bool,
     /// Generate `impl Reflectable` for owned message types (bridge mode).
     ///
     /// When enabled, each generated message gets an
@@ -1732,9 +1936,10 @@ pub struct CodeGenConfig {
     /// and nested, plus their derived view/owned-view types). It does not
     /// apply to:
     ///
-    /// - module names (`message Outer` still nests under `pub mod outer` —
-    ///   modules are namespaced by the package tree and never collide with
-    ///   type names),
+    /// - module names (`message Outer` still nests under `pub mod outer`).
+    ///   A prefix can remove a module's trailing `_`: the nested types of
+    ///   `message item` are in `item_` beside `struct item`, and in `item`
+    ///   beside `struct Pbitem`,
     /// - oneof enums (structurally namespaced under `__buffa::oneof::`,
     ///   named after the oneof declaration, not the message),
     /// - types mapped away via [`extern_paths`](Self::extern_paths) or the
@@ -1785,6 +1990,33 @@ pub struct CodeGenConfig {
     /// [`CodeGenWarning::ExcludePackageMatchedNothing`] for an entry that
     /// matches no package in the input.
     pub exclude_packages: Vec<String>,
+    /// The [`CodecStrategy`] of every message that no
+    /// [`codec_strategy_in`](Self::codec_strategy_in) rule covers (default:
+    /// [`CodecStrategy::Unrolled`]).
+    ///
+    /// Under [`CodecStrategy::Table`] a message that cannot use the table
+    /// stays unrolled, and codegen reports one
+    /// [`CodeGenWarning::TableCodecFallbackSummary`] for the run.
+    pub codec_strategy: CodecStrategy,
+    /// Path-scoped overrides for [`codec_strategy`](Self::codec_strategy).
+    /// Each entry is `(proto_path_prefix, strategy)`, with a leading dot
+    /// (`".pkg.Msg"`).
+    ///
+    /// Matching uses the same proto-segment-aware prefix rules as
+    /// [`preserve_unknown_fields_in`](Self::preserve_unknown_fields_in): a rule
+    /// covers the message it names *and every message nested inside it*, `"."`
+    /// covers everything, and the **last** matching rule wins.
+    ///
+    /// A [`CodecStrategy::Table`] rule that covers a message that cannot use
+    /// the table keeps it unrolled and counts it in the
+    /// [`CodeGenWarning::TableCodecFallbackSummary`]. If the rule names the
+    /// message by its exact path, that is an error instead, because the rule
+    /// asked for something impossible. A rule that matches no generated message
+    /// produces a [`CodeGenWarning::CodecStrategyRuleMatchedNothing`].
+    ///
+    /// A rule does not extend to the messages a message holds; see
+    /// [`CodecStrategy::Table`].
+    pub codec_strategy_in: Vec<(String, CodecStrategy)>,
 }
 
 impl Default for CodeGenConfig {
@@ -1798,6 +2030,7 @@ impl Default for CodeGenConfig {
             deny_unknown_json_fields_in: Vec::new(),
             generate_json: false,
             generate_arbitrary: false,
+            skip_debug: Vec::new(),
             extern_paths: Vec::new(),
             bytes_fields: Vec::new(),
             string_fields: Vec::new(),
@@ -1816,8 +2049,10 @@ impl Default for CodeGenConfig {
             message_attributes: Vec::new(),
             enum_attributes: Vec::new(),
             oneof_attributes: Vec::new(),
+            oneof_struct_field_attributes: Vec::new(),
             gate_impls_on_crate_features: false,
             generate_with_setters: true,
+            map_entries_omit_defaults: false,
             generate_reflection: false,
             generate_reflection_vtable: false,
             shared_descriptor_pool: false,
@@ -1830,6 +2065,8 @@ impl Default for CodeGenConfig {
             feature_gate_names: FeatureGateNames::default(),
             type_name_prefix: String::new(),
             exclude_packages: Vec::new(),
+            codec_strategy: CodecStrategy::Unrolled,
+            codec_strategy_in: Vec::new(),
         }
     }
 }
@@ -1866,11 +2103,13 @@ impl CodeGenConfig {
         self.feature_gates().reflect
     }
 
-    /// Apply [`type_name_prefix`](Self::type_name_prefix) to a locally
-    /// generated type's proto simple name, yielding the Rust identifier to
-    /// declare (and register in the type map).
+    /// Returns the Rust name of a locally generated type:
+    /// [`type_name_prefix`](Self::type_name_prefix), then the proto simple
+    /// name, with [`idents::escape_type_name`] applied to the two joined.
+    /// This is the name the type is declared with and the name in the type
+    /// map.
     pub(crate) fn prefixed_type_name(&self, proto_name: &str) -> String {
-        format!("{}{proto_name}", self.type_name_prefix)
+        idents::local_type_name(&self.type_name_prefix, proto_name)
     }
 
     /// Validate [`type_name_prefix`](Self::type_name_prefix): empty (no
@@ -2091,6 +2330,28 @@ pub enum CodeGenWarning {
         /// by proto name.
         assignments: Vec<(String, String)>,
     },
+    /// A member's keyword-escaped Rust name is also the name of another
+    /// member, and the keyword member was renamed.
+    ///
+    /// A field or oneof whose Rust name is `self`, `super`, `crate` or `Self`
+    /// (after any `idiomatic_field_names` conversion) is generated as `self_`.
+    /// Next to a member named `self_`, it is generated as `self__`, with more
+    /// underscores while that name is taken too. Wire, JSON and text-format
+    /// names are unaffected. Two oneofs named `self` and `self_` fail with
+    /// [`CodeGenError::OneofEnumNameConflict`] instead.
+    ///
+    /// A field is identified by its name and number, and a oneof by its
+    /// name, across the messages of every generated file. A message that
+    /// declares the same member gets the same Rust name and this warning,
+    /// even when it has no `self_` member of its own.
+    #[non_exhaustive]
+    KeywordEscapedNamesAdjusted {
+        /// Fully-qualified proto name of the affected message.
+        message_name: String,
+        /// `(proto_name, final_rust_name)` for each adjusted member, sorted by
+        /// proto name.
+        assignments: Vec<(String, String)>,
+    },
     /// A field in a kept file references a type from a package that is neither
     /// being generated nor covered by an [`extern_path`](CodeGenConfig::extern_paths)
     /// mapping. The generated code will emit a dangling type path that fails to
@@ -2182,6 +2443,83 @@ pub enum CodeGenWarning {
         /// The rule's path as configured.
         rule: String,
     },
+    /// A [`skip_debug`](CodeGenConfig::skip_debug) rule matched no generated
+    /// message and named no generated enum, so it changed nothing. Usually a
+    /// typo, a field or oneof path instead of a type path (a oneof is covered
+    /// by its message's rule), or a rule for a package mapped through
+    /// `extern_path`. Every generated `Debug` impl is still emitted, so a
+    /// hand-written impl for the intended type fails to compile as a
+    /// conflicting implementation.
+    #[non_exhaustive]
+    SkipDebugRuleMatchedNothing {
+        /// The rule's path as configured.
+        rule: String,
+    },
+    /// A [`bytes_fields`](CodeGenConfig::bytes_fields),
+    /// [`string_fields`](CodeGenConfig::string_fields),
+    /// [`map_fields`](CodeGenConfig::map_fields) or
+    /// [`repeated_fields`](CodeGenConfig::repeated_fields) rule matched no
+    /// field of a message generated by this call, so it changed nothing.
+    ///
+    /// Usually a typo, a path without its leading dot or its package, a
+    /// prost-style suffix path such as `"items"`, or a path into a map-entry
+    /// message (a rule reaches a map through the map field's own path). A
+    /// package rule over messages that have no fields also warns.
+    ///
+    /// The check compares paths only: a rule whose path is a field of another
+    /// type (a `string_fields` rule on an `int32` field) is also inert and
+    /// does not warn. It runs once per `generate` call, so a config shared by
+    /// several calls warns in each call whose files lack the field.
+    #[non_exhaustive]
+    FieldTypeRuleMatchedNothing {
+        /// The rule's path as it is in the [`CodeGenConfig`] list
+        /// (`buffa-build` has normalized it).
+        rule: String,
+        /// The [`CodeGenConfig`] list that contains the rule: `"bytes_fields"`,
+        /// `"string_fields"`, `"map_fields"` or `"repeated_fields"`.
+        option: &'static str,
+        /// Whether the rule matches a field of a message that this call does
+        /// not generate: one in an imported file, or in a package under
+        /// `extern_path` or `exclude_packages`. The `Display` text then says
+        /// so, in place of the path hint.
+        matches_ungenerated: bool,
+    },
+    /// A [`codec_strategy_in`](CodeGenConfig::codec_strategy_in) rule matched no
+    /// message being generated, so it changed nothing. Usually a typo, a field
+    /// path instead of a message path, or a rule for a package mapped through
+    /// `extern_path`.
+    #[non_exhaustive]
+    CodecStrategyRuleMatchedNothing {
+        /// The rule's path as configured.
+        rule: String,
+    },
+    /// Some messages selected for [`CodecStrategy::Table`], by the global
+    /// [`codec_strategy`](CodeGenConfig::codec_strategy) or by a
+    /// [`codec_strategy_in`](CodeGenConfig::codec_strategy_in) rule, cannot use
+    /// the table and are generated [`CodecStrategy::Unrolled`]. One warning
+    /// covers the whole run.
+    #[non_exhaustive]
+    TableCodecFallbackSummary {
+        /// The number of messages that fell back.
+        fallbacks: usize,
+        /// The number of messages selected for the table.
+        selected: usize,
+        /// Why they fell back, most common reason first.
+        reasons: Vec<TableCodecFallbackReason>,
+    },
+}
+
+/// The `buffa-build` methods that add to the field-type rule list `option`,
+/// for [`CodeGenWarning::FieldTypeRuleMatchedNothing`]'s text. A user of
+/// `buffa-build` typed one of these, not the [`CodeGenConfig`] field's name.
+fn field_type_rule_builders(option: &str) -> &'static str {
+    match option {
+        "bytes_fields" => "bytes_type_in / use_bytes_type_in / bytes_type_custom_in",
+        "string_fields" => "string_type_in / string_type_custom_in",
+        "map_fields" => "map_type_in / map_type_custom_in",
+        "repeated_fields" => "repeated_type_in / repeated_type_custom_in",
+        _ => "",
+    }
 }
 
 impl core::fmt::Display for CodeGenWarning {
@@ -2256,6 +2594,22 @@ impl core::fmt::Display for CodeGenWarning {
                     parts.join(", ")
                 )
             }
+            Self::KeywordEscapedNamesAdjusted {
+                message_name,
+                assignments,
+            } => {
+                let parts: Vec<String> = assignments
+                    .iter()
+                    .map(|(proto, rust)| format!("`{proto}` → `{rust}`"))
+                    .collect();
+                write!(
+                    f,
+                    "message `{message_name}`: a member's keyword-escaped Rust name is the \
+                     name of another member, in this message or in one that declares the \
+                     same member; adjusted: {} (wire/JSON/text names are unaffected)",
+                    parts.join(", ")
+                )
+            }
             Self::ExcludedPackageFieldRef {
                 file_name,
                 message_name,
@@ -2312,6 +2666,46 @@ impl core::fmt::Display for CodeGenWarning {
                      check the path against the fully-qualified proto message names"
                 )
             }
+            Self::CodecStrategyRuleMatchedNothing { rule } => {
+                write!(
+                    f,
+                    "codec_strategy_in rule '{rule}' matched no generated message; those \
+                     messages keep the global codec_strategy setting — check the path \
+                     against the fully-qualified proto message names"
+                )
+            }
+            Self::TableCodecFallbackSummary {
+                fallbacks,
+                selected,
+                reasons,
+            } => {
+                write!(
+                    f,
+                    "{fallbacks} of {selected} messages selected for the table codec use the \
+                     unrolled codec instead"
+                )?;
+                for (i, r) in reasons.iter().enumerate() {
+                    let sep = if i == 0 { ": " } else { "; " };
+                    let shown = r.messages.len().min(3);
+                    let examples = r.messages[..shown].join(", ");
+                    let more = match r.messages.len() - shown {
+                        0 => String::new(),
+                        n => format!(", and {n} more"),
+                    };
+                    write!(
+                        f,
+                        "{sep}{} ({}: {examples}{more})",
+                        r.reason,
+                        r.messages.len()
+                    )?;
+                }
+                write!(
+                    f,
+                    ". To silence this warning, set the messages that fell back to the unrolled \
+                     codec (buffa-build: `.codec_strategy_in(CodecStrategy::Unrolled, \
+                     &[\"<path>\"])`; plugin: `codec_strategy_in=<path>=unrolled`)"
+                )
+            }
             Self::DenyUnknownJsonFieldsRuleMatchedNothing { rule } => {
                 write!(
                     f,
@@ -2320,8 +2714,65 @@ impl core::fmt::Display for CodeGenWarning {
                      check the path against the fully-qualified proto message names"
                 )
             }
+            Self::SkipDebugRuleMatchedNothing { rule } => {
+                write!(
+                    f,
+                    "skip_debug rule '{rule}' matched no generated message or enum, \
+                     so a hand-written Debug impl will conflict with the generated one — \
+                     use the fully-qualified proto type name \
+                     (a oneof is covered by its message's rule)"
+                )
+            }
+            Self::FieldTypeRuleMatchedNothing {
+                rule,
+                option,
+                matches_ungenerated,
+            } => {
+                let builders = field_type_rule_builders(option);
+                write!(f, "{option} rule '{rule}' (buffa-build: {builders}) ")?;
+                if *matches_ungenerated {
+                    write!(
+                        f,
+                        "matches only fields of messages this run does not generate \
+                         (an imported file, or a package under extern_path or \
+                         exclude_package), so it changed nothing here"
+                    )
+                } else {
+                    write!(
+                        f,
+                        "matched no field of a generated message, so it changed nothing — \
+                         a rule is a fully-qualified proto path with its leading dot \
+                         ('.my.pkg', '.my.pkg.Msg' or '.my.pkg.Msg.field'); a bare name \
+                         such as 'field' or 'Msg.field' does not match"
+                    )
+                }
+            }
         }
     }
+}
+
+/// The files named in `files_to_generate`, each with its package as a
+/// leading-dot proto path (empty for a file without a package).
+fn generated_files<'a>(
+    file_descriptors: &'a [FileDescriptorProto],
+    files_to_generate: &'a [String],
+) -> impl Iterator<Item = (&'a FileDescriptorProto, String)> {
+    file_descriptors
+        .iter()
+        .filter(move |fd| {
+            fd.name
+                .as_deref()
+                .is_some_and(|n| files_to_generate.iter().any(|g| g == n))
+        })
+        .map(|fd| {
+            let package = fd.package.as_deref().unwrap_or("");
+            let package_fqn = if package.is_empty() {
+                String::new()
+            } else {
+                format!(".{package}")
+            };
+            (fd, package_fqn)
+        })
 }
 
 /// Whether `rule` (a leading-dot proto path prefix) matches at least one
@@ -2340,22 +2791,72 @@ fn rule_matches_generated_message(
     }
 
     rule == "."
-        || file_descriptors
+        || generated_files(file_descriptors, files_to_generate)
+            .any(|(fd, package_fqn)| any_message_matches(rule, &package_fqn, &fd.message_type))
+}
+
+/// Whether `rule` (a leading-dot proto path) is the fully-qualified name of
+/// an enum, top-level or nested in a message, declared in
+/// `files_to_generate`.
+fn rule_names_generated_enum(
+    rule: &str,
+    file_descriptors: &[FileDescriptorProto],
+    files_to_generate: &[String],
+) -> bool {
+    fn names_enum(rule: &str, parent_fqn: &str, enums: &[EnumDescriptorProto]) -> bool {
+        enums
             .iter()
-            .filter(|fd| {
-                fd.name
-                    .as_deref()
-                    .is_some_and(|n| files_to_generate.iter().any(|g| g == n))
-            })
-            .any(|fd| {
-                let package = fd.package.as_deref().unwrap_or("");
-                let parent_fqn = if package.is_empty() {
-                    String::new()
-                } else {
-                    format!(".{package}")
-                };
-                any_message_matches(rule, &parent_fqn, &fd.message_type)
-            })
+            .any(|e| format!("{parent_fqn}.{}", e.name.as_deref().unwrap_or("")) == rule)
+    }
+    fn names_nested_enum(rule: &str, parent_fqn: &str, messages: &[DescriptorProto]) -> bool {
+        messages.iter().any(|m| {
+            let fqn = format!("{parent_fqn}.{}", m.name.as_deref().unwrap_or(""));
+            names_enum(rule, &fqn, &m.enum_type) || names_nested_enum(rule, &fqn, &m.nested_type)
+        })
+    }
+
+    generated_files(file_descriptors, files_to_generate).any(|(fd, package_fqn)| {
+        names_enum(rule, &package_fqn, &fd.enum_type)
+            || names_nested_enum(rule, &package_fqn, &fd.message_type)
+    })
+}
+
+/// Whether `rule` (a leading-dot proto path prefix) matches at least one
+/// field of a message, nested messages included, declared in the files named
+/// by `file_names`. The fields of a map-entry message do not count: a rule
+/// reaches a map through the map field's own path.
+fn rule_matches_field_in(
+    rule: &str,
+    file_descriptors: &[FileDescriptorProto],
+    file_names: &[String],
+) -> bool {
+    fn any_field_matches(rule: &str, parent_fqn: &str, messages: &[DescriptorProto]) -> bool {
+        messages.iter().any(|m| {
+            let is_map_entry = m
+                .options
+                .as_option()
+                .and_then(|o| o.map_entry)
+                .unwrap_or(false);
+            if is_map_entry {
+                return false;
+            }
+            let fqn = format!("{parent_fqn}.{}", m.name.as_deref().unwrap_or(""));
+            m.field.iter().any(|f| {
+                let field_fqn = format!("{fqn}.{}", f.name.as_deref().unwrap_or(""));
+                context::matches_proto_prefix(rule, &field_fqn)
+            }) || any_field_matches(rule, &fqn, &m.nested_type)
+        })
+    }
+
+    rule == "."
+        || generated_files(file_descriptors, file_names)
+            .any(|(fd, package_fqn)| any_field_matches(rule, &package_fqn, &fd.message_type))
+}
+
+/// The paths of a field-type rule list such as
+/// [`CodeGenConfig::string_fields`], in order.
+fn rule_paths<R>(rules: &[(String, R)]) -> Vec<&String> {
+    rules.iter().map(|(path, _)| path).collect()
 }
 
 /// Generate Rust source files from a set of file descriptors.
@@ -2363,7 +2864,8 @@ fn rule_matches_generated_message(
 /// `files_to_generate` is the set of file names that were explicitly requested
 /// (matching `CodeGeneratorRequest.file_to_generate`). Descriptors for
 /// dependencies may be present in `file_descriptors` but won't produce output
-/// files unless they appear in `files_to_generate`.
+/// files unless they appear in `files_to_generate`. A name listed twice is
+/// generated once.
 ///
 /// Each `.proto` emits up to five content files (kinds with no content
 /// are omitted); each distinct package emits one `<pkg>.mod.rs`
@@ -2376,6 +2878,10 @@ fn rule_matches_generated_message(
 /// idiomatic CamelCase aliases were suppressed by a naming conflict) are
 /// **discarded** here. Use [`generate_with_diagnostics`] to receive them and
 /// surface them as build warnings.
+///
+/// # Errors
+///
+/// As [`generate_with_diagnostics`].
 pub fn generate(
     file_descriptors: &[FileDescriptorProto],
     files_to_generate: &[String],
@@ -2384,29 +2890,6 @@ pub fn generate(
     Ok(generate_with_diagnostics(file_descriptors, files_to_generate, config)?.0)
 }
 
-/// Like [`generate`], but also returns the non-fatal [`CodeGenWarning`]s
-/// collected during generation (e.g. enums whose idiomatic CamelCase aliases
-/// were suppressed by a naming conflict).
-///
-/// Surface each warning via its [`Display`](core::fmt::Display) impl — e.g. as a
-/// `cargo:warning=...` from a `build.rs`, or on stderr from a standalone
-/// generator — or match on it for programmatic handling. [`generate`] discards
-/// them, so existing callers are unaffected.
-///
-/// Warnings are returned only on success. On error, any warnings already
-/// collected are dropped along with the partial output — the [`CodeGenError`]
-/// is the actionable signal.
-///
-/// # Errors
-///
-/// Returns [`CodeGenError::FileNotFound`] if a name in `files_to_generate` has
-/// no matching descriptor, [`CodeGenError::InvalidTypeNamePrefix`] if
-/// [`CodeGenConfig::type_name_prefix`] is not empty or PascalCase,
-/// [`CodeGenError::Other`] if `generate_reflection_vtable`
-/// is set without `generate_reflection` or if an active feature-gate name in
-/// [`CodeGenConfig::feature_gate_names`] is not a valid Cargo feature name,
-/// and other [`CodeGenError`] variants for malformed descriptors (e.g. a
-/// missing required field) encountered while generating.
 /// Whether a custom `repeated` element type holds proto `string` or `bytes` —
 /// selects `ValueRef::String`/`ValueRef::Bytes` and the JSON delegate module.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2554,18 +3037,18 @@ fn render_custom_elem_impls(
             out.extend(feature_gates::cfg_block(
                 quote! {
                     impl ::buffa::json_helpers::ProtoElemJson for #ty {
-                        fn serialize_proto_json<S: ::serde::Serializer>(
+                        fn serialize_proto_json<__S: ::serde::Serializer>(
                             v: &Self,
-                            s: S,
-                        ) -> ::core::result::Result<S::Ok, S::Error> {
+                            s: __S,
+                        ) -> ::core::result::Result<__S::Ok, __S::Error> {
                             ::buffa::json_helpers::bytes::serialize(
                                 ::core::convert::AsRef::<[u8]>::as_ref(v),
                                 s,
                             )
                         }
-                        fn deserialize_proto_json<'de, D: ::serde::Deserializer<'de>>(
-                            d: D,
-                        ) -> ::core::result::Result<Self, D::Error> {
+                        fn deserialize_proto_json<'de, __D: ::serde::Deserializer<'de>>(
+                            d: __D,
+                        ) -> ::core::result::Result<Self, __D::Error> {
                             ::buffa::json_helpers::bytes::deserialize(d)
                         }
                     }
@@ -2782,11 +3265,10 @@ fn warn_excluded_refs_msg(
         // may be from an excluded package. Attribute the warning to the outer
         // map field name (e.g. "prices"), not the entry's "value" slot.
         //
-        // The LABEL_REPEATED gate mirrors every other is_map_field call site.
-        // find_map_entry matches on the type_name suffix, so a singular
-        // `dep.PricesEntry legacy` field would otherwise be taken for the
-        // same-named synthetic entry and get a redundant value-slot check;
-        // the field itself is already checked above either way.
+        // The LABEL_REPEATED gate mirrors every other is_map_field call site:
+        // is_map_field looks at the type, not the label, so a singular field
+        // typed as the synthetic entry would otherwise get the value-slot
+        // check. The field itself is already checked above either way.
         let is_repeated = field.label.unwrap_or_default() == Label::LABEL_REPEATED;
         if is_repeated && crate::message::is_map_field(msg, field) {
             // Malformed entries (no key/value) are silently skipped — this is a
@@ -2823,6 +3305,57 @@ fn warn_excluded_refs_msg(
     }
 }
 
+/// Like [`generate`], but also returns the non-fatal [`CodeGenWarning`]s
+/// collected during generation (e.g. enums whose idiomatic CamelCase aliases
+/// were suppressed by a naming conflict).
+///
+/// Report each warning through its [`Display`](core::fmt::Display) impl — e.g.
+/// as a `cargo:warning=...` from a `build.rs`, or on stderr from a standalone
+/// generator — or match on it for programmatic handling. [`generate`] discards
+/// them.
+///
+/// A name listed twice in `files_to_generate` is generated once.
+///
+/// Warnings are returned only on success. On error, any warnings already
+/// collected are dropped along with the partial output — the [`CodeGenError`]
+/// is the actionable signal.
+///
+/// # Errors
+///
+/// - [`CodeGenError::FileNotFound`] if a name in `files_to_generate` has no
+///   matching descriptor.
+/// - [`CodeGenError::OutputFileNameConflict`] if two generated files would
+///   be written to the same output path.
+/// - [`CodeGenError::InvalidTypeNamePrefix`] if
+///   [`CodeGenConfig::type_name_prefix`] is neither empty nor PascalCase.
+/// - [`CodeGenError::InvalidCustomAttribute`] if a custom attribute string,
+///   such as one in [`CodeGenConfig::type_attributes`], is not one or more
+///   outer `#[...]` attributes.
+/// - [`CodeGenError::Other`] if `config` sets an option without the option
+///   it requires: `generate_reflection_vtable` or `shared_descriptor_pool`
+///   without `generate_reflection`, `shared_descriptor_pool_root` without
+///   `shared_descriptor_pool`, or `idiomatic_imports` without
+///   `file_per_package`.
+/// - [`CodeGenError::Other`] if an active feature-gate name in
+///   [`CodeGenConfig::feature_gate_names`] is not a valid Cargo feature name,
+///   or if `shared_descriptor_pool_root` or an `exclude_packages` entry is
+///   malformed.
+/// - [`CodeGenError::SharedCorpusContextMismatch`] if
+///   [`CodeGenConfig::shared_corpus_context`] was built from a different
+///   corpus or different rules than this call uses.
+/// - For a valid schema whose names collide in the generated Rust:
+///   [`CodeGenError::OneofEnumNameConflict`],
+///   [`CodeGenError::OneofVariantNameConflict`],
+///   [`CodeGenError::TypeNameConflict`],
+///   [`CodeGenError::ModuleNameConflict`],
+///   [`CodeGenError::ReservedFieldName`] or
+///   [`CodeGenError::ReservedModuleName`].
+/// - [`CodeGenError::DuplicateFieldNumber`] if a message of a file in
+///   `files_to_generate` has two fields with one field number, which protoc
+///   rejects.
+/// - Other [`CodeGenError`] variants for a schema that generation does not
+///   support or a malformed descriptor, such as
+///   [`CodeGenError::MissingField`].
 pub fn generate_with_diagnostics(
     file_descriptors: &[FileDescriptorProto],
     files_to_generate: &[String],
@@ -2897,6 +3430,7 @@ pub fn generate_with_diagnostics(
     }
 
     config.validate_type_name_prefix()?;
+    context::validate_custom_attributes(config)?;
 
     // Normalize exclude_packages entries (optional leading dot stripped). The
     // plugin normalizes before it gets here and buffa-build validates in
@@ -3004,6 +3538,63 @@ pub fn generate_with_diagnostics(
         }
     }
 
+    // Warn per inert `skip_debug` rule; `SkipDebugRuleMatchedNothing`
+    // documents the consequence.
+    for rule in &config.skip_debug {
+        if !rule_matches_generated_message(rule, file_descriptors, files_to_generate)
+            && !rule_names_generated_enum(rule, file_descriptors, files_to_generate)
+        {
+            ctx.warn(CodeGenWarning::SkipDebugRuleMatchedNothing { rule: rule.clone() });
+        }
+    }
+
+    // A field-type rule that matches no generated field leaves the fields it
+    // was written for on their default Rust type, and the build still
+    // succeeds, so warn per rule.
+    let field_type_rules = [
+        ("bytes_fields", rule_paths(&config.bytes_fields)),
+        ("string_fields", rule_paths(&config.string_fields)),
+        ("map_fields", rule_paths(&config.map_fields)),
+        ("repeated_fields", rule_paths(&config.repeated_fields)),
+    ];
+    let mut every_file: Option<Vec<String>> = None;
+    for (option, rules) in field_type_rules {
+        for rule in rules {
+            if rule_matches_field_in(rule, file_descriptors, files_to_generate) {
+                continue;
+            }
+            let every_file: &[String] = every_file.get_or_insert_with(|| {
+                file_descriptors
+                    .iter()
+                    .filter_map(|fd| fd.name.clone())
+                    .collect()
+            });
+            ctx.warn(CodeGenWarning::FieldTypeRuleMatchedNothing {
+                rule: rule.clone(),
+                option,
+                matches_ungenerated: rule_matches_field_in(rule, file_descriptors, every_file),
+            });
+        }
+    }
+
+    // A rule that names no generated message (typo, field path, extern-mapped
+    // package) leaves its messages on the global strategy.
+    for (rule, _) in &config.codec_strategy_in {
+        if !rule_matches_generated_message(rule, file_descriptors, files_to_generate) {
+            ctx.warn(CodeGenWarning::CodecStrategyRuleMatchedNothing { rule: rule.clone() });
+        }
+    }
+    // Two fields with one number make the generated code wrong under either
+    // codec. Checked before the table plan: a message that also cannot use
+    // the table would otherwise get the plan's advice to select the unrolled
+    // codec, which fails here too.
+    for (file, _) in generated_files(file_descriptors, files_to_generate) {
+        check_field_numbers(&file.message_type, file.package.as_deref().unwrap_or(""))?;
+    }
+    if ctx.table_codec_requested() {
+        ctx.plan_table_codec(file_descriptors, files_to_generate)?;
+    }
+
     // Lazy views need the eager view machinery; warn once per run.
     if config.lazy_views && !config.generate_views {
         ctx.warn(CodeGenWarning::LazyViewsRequireViews);
@@ -3031,7 +3622,12 @@ pub fn generate_with_diagnostics(
     // Group requested files by package. BTreeMap → deterministic output order.
     let mut by_package: std::collections::BTreeMap<String, Vec<&FileDescriptorProto>> =
         std::collections::BTreeMap::new();
+    let mut grouped = std::collections::HashSet::new();
     for file_name in files_to_generate {
+        // A file listed twice is generated once.
+        if !grouped.insert(file_name.as_str()) {
+            continue;
+        }
         let file_desc = file_descriptors
             .iter()
             .find(|f| f.name.as_deref() == Some(file_name.as_str()))
@@ -3134,6 +3730,7 @@ pub fn generate_with_diagnostics(
 
     let empty_impls = TokenStream::new();
     let mut output = Vec::new();
+    let mut output_names = OutputNames::default();
     let mut custom_emitted = false;
     for (package, files) in by_package {
         let impls = if custom_emitted {
@@ -3142,10 +3739,47 @@ pub fn generate_with_diagnostics(
             custom_emitted = true;
             &custom_elem_impls
         };
-        generate_package(&ctx, &package, &files, &fds_bytes, impls, &mut output)?;
+        generate_package(
+            &ctx,
+            &package,
+            &files,
+            &fds_bytes,
+            impls,
+            &mut output_names,
+            &mut output,
+        )?;
     }
 
     Ok((output, ctx.take_warnings()))
+}
+
+/// The output paths assigned so far in one [`generate`] call, each with the
+/// input it was generated from, in the form
+/// [`CodeGenError::OutputFileNameConflict`] documents.
+#[derive(Default)]
+struct OutputNames(std::collections::HashMap<String, String>);
+
+impl OutputNames {
+    /// Records that `source` generates `file_name`.
+    ///
+    /// # Errors
+    ///
+    /// [`CodeGenError::OutputFileNameConflict`] if another input already
+    /// generates `file_name`.
+    fn claim(&mut self, file_name: &str, source: String) -> Result<(), CodeGenError> {
+        use std::collections::hash_map::Entry;
+        match self.0.entry(file_name.to_owned()) {
+            Entry::Occupied(first) => Err(CodeGenError::OutputFileNameConflict {
+                file_name: file_name.to_owned(),
+                first_source: first.get().clone(),
+                second_source: source,
+            }),
+            Entry::Vacant(slot) => {
+                slot.insert(source);
+                Ok(())
+            }
+        }
+    }
 }
 
 /// Generate a module tree that assembles per-package `.mod.rs` files into
@@ -3209,12 +3843,14 @@ pub fn generate_module_tree<F: AsRef<str>, P: AsRef<str>>(
         for file in &node.files {
             match mode {
                 IncludeMode::Relative(prefix) => {
-                    let _ = writeln!(out, r#"{indent}include!("{prefix}{file}");"#);
+                    let path = format!("{prefix}{file}");
+                    let _ = writeln!(out, "{indent}include!({path:?});");
                 }
                 IncludeMode::OutDir => {
+                    let path = format!("/{file}");
                     let _ = writeln!(
                         out,
-                        r#"{indent}include!(concat!(env!("OUT_DIR"), "/{file}"));"#
+                        "{indent}include!(concat!(env!(\"OUT_DIR\"), {path:?}));"
                     );
                 }
             }
@@ -3593,21 +4229,87 @@ fn validate_shared_root_name(
     Ok(())
 }
 
+/// Rejects two sibling types that [`idents::local_type_name`] maps to one
+/// Rust name. An empty name is skipped; [`required_type_name`] reports it.
+fn check_type_names<'a>(
+    scope: &str,
+    names: impl Iterator<Item = &'a str>,
+    type_name_prefix: &str,
+) -> Result<(), CodeGenError> {
+    let mut seen: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
+    for name in names.filter(|name| !name.is_empty()) {
+        let rust_name = idents::local_type_name(type_name_prefix, name);
+        if let Some(first) = seen.insert(rust_name.clone(), name) {
+            return Err(CodeGenError::TypeNameConflict {
+                scope: scope.to_string(),
+                first_type: first.to_string(),
+                second_type: name.to_string(),
+                rust_name,
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Returns [`CodeGenError::DuplicateFieldNumber`] for the first message of
+/// `messages`, or nested in one, that has two fields with one number.
+/// `scope` is the full name of what contains `messages`: the package, or the
+/// enclosing message.
+///
+/// A oneof member is a field of the message, so it is compared with every
+/// other field. An extension declared in the message is a field of its
+/// extendee, so it is not compared with the message's own fields, and an
+/// extension's number is not checked against its extendee here.
+fn check_field_numbers(
+    messages: &[crate::generated::descriptor::DescriptorProto],
+    scope: &str,
+) -> Result<(), CodeGenError> {
+    for msg in messages {
+        let name = msg.name.as_deref().unwrap_or("");
+        let fqn = if scope.is_empty() {
+            name.to_string()
+        } else {
+            format!("{scope}.{name}")
+        };
+        let mut seen: std::collections::HashMap<i32, &str> = std::collections::HashMap::new();
+        for field in &msg.field {
+            let Some(number) = field.number else {
+                continue;
+            };
+            let field_name = field.name.as_deref().unwrap_or("");
+            if let Some(first) = seen.insert(number, field_name) {
+                return Err(CodeGenError::DuplicateFieldNumber {
+                    message_name: fqn,
+                    first_field: first.to_string(),
+                    second_field: field_name.to_string(),
+                    number,
+                });
+            }
+        }
+        check_field_numbers(&msg.nested_type, &fqn)?;
+    }
+    Ok(())
+}
+
 /// Validate one input descriptor before generating code for it.
 ///
 /// Checks, in one walk of the message tree:
 ///
+/// - **Required type names**: every message and enum has a non-empty name.
 /// - **Reserved field names**: no field starts with `__buffa_` (would clash
 ///   with generated `__buffa_unknown_fields` / `__buffa_cached_size`).
 /// - **Module-name conflicts**: no two sibling messages snake_case to the
 ///   same module name (e.g. `HTTPRequest` vs `HttpRequest`).
+/// - **Type-name conflicts**: no two messages or enums nested in one message
+///   escape to the same Rust type name (e.g. `bool` vs `bool_`). The caller
+///   checks the package-level types, which span files.
 /// - **Reserved sentinel**: no package segment, message-module name, or
 ///   file-level enum name equals [`SENTINEL_MOD`](context::SENTINEL_MOD).
 ///   Ancillary types live under `pkg::__buffa::…`; a proto element
 ///   emitting an item named `__buffa` at package root would produce
 ///   E0428 against `pub mod __buffa`. This is the only name buffa
 ///   reserves in user namespace.
-fn validate_file(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
+fn validate_file(file: &FileDescriptorProto, type_name_prefix: &str) -> Result<(), CodeGenError> {
     use std::collections::HashMap;
 
     let sentinel = context::SENTINEL_MOD;
@@ -3624,7 +4326,7 @@ fn validate_file(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
     // enums live inside their owner message's module and cannot collide
     // with the package-root sentinel, so only file-level is checked.
     for enum_type in &file.enum_type {
-        let name = enum_type.name.as_deref().unwrap_or("");
+        let name = required_type_name(enum_type.name.as_deref(), "enum.name")?;
         if name == sentinel {
             return Err(CodeGenError::ReservedModuleName {
                 name: sentinel.to_string(),
@@ -3637,17 +4339,30 @@ fn validate_file(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
         messages: &[crate::generated::descriptor::DescriptorProto],
         scope: &str,
         sentinel: &str,
+        type_name_prefix: &str,
     ) -> Result<(), CodeGenError> {
         // snake_case module name → original proto name (for conflict diag).
         let mut seen: HashMap<String, &str> = HashMap::new();
 
         for msg in messages {
-            let name = msg.name.as_deref().unwrap_or("");
+            let name = required_type_name(msg.name.as_deref(), "message.name")?;
             let fqn = if scope.is_empty() {
                 name.to_string()
             } else {
                 format!("{scope}.{name}")
             };
+
+            for enum_type in &msg.enum_type {
+                required_type_name(enum_type.name.as_deref(), "enum.name")?;
+            }
+            check_type_names(
+                &fqn,
+                msg.nested_type
+                    .iter()
+                    .filter_map(|m| m.name.as_deref())
+                    .chain(msg.enum_type.iter().filter_map(|e| e.name.as_deref())),
+                type_name_prefix,
+            )?;
 
             for field in &msg.field {
                 if let Some(fname) = &field.name {
@@ -3677,12 +4392,25 @@ fn validate_file(file: &FileDescriptorProto) -> Result<(), CodeGenError> {
             }
             seen.insert(module_name, name);
 
-            walk(&msg.nested_type, &fqn, sentinel)?;
+            walk(&msg.nested_type, &fqn, sentinel, type_name_prefix)?;
         }
         Ok(())
     }
 
-    walk(&file.message_type, package, sentinel)
+    walk(&file.message_type, package, sentinel, type_name_prefix)
+}
+
+/// Returns the name of a message or enum descriptor, or
+/// [`CodeGenError::MissingField`]`(field)` if the name is absent or empty.
+///
+/// An empty name cannot be a Rust identifier, so it is rejected like an
+/// absent one.
+fn required_type_name<'a>(
+    name: Option<&'a str>,
+    field: &'static str,
+) -> Result<&'a str, CodeGenError> {
+    name.filter(|name| !name.is_empty())
+        .ok_or(CodeGenError::MissingField(field))
 }
 
 /// Per-proto content streams plus the file stem, ready to be formatted.
@@ -3714,7 +4442,7 @@ fn generate_proto_content(
     use crate::idents::make_field_ident;
     use crate::message::MessageOutput;
 
-    validate_file(file)?;
+    validate_file(file, &ctx.config.type_name_prefix)?;
 
     let resolver = imports::ImportResolver::new();
     let features = crate::features::for_file(file);
@@ -3768,25 +4496,13 @@ fn generate_proto_content(
             current_package,
             &rust_name,
             &proto_fqn,
-            &features,
+            &crate::features::message_scope_features(&features, message_type, true),
             &resolver,
         )?;
         owned.extend(owned_top);
         let mod_name = ctx.nested_module_name(current_package, top_level_name);
         let mod_ident = make_field_ident(&mod_name);
-        // When the nested-types module was deconflicted from a sub-package
-        // (issue #135), document why the name carries a trailing `_`.
-        let mod_doc = if mod_name == crate::oneof::to_snake_case(top_level_name) {
-            quote! {}
-        } else {
-            let doc = format!(
-                "Nested items of `{top_level_name}`. The module name carries a \
-                 trailing `_` to avoid a collision with another module in this \
-                 scope (a sub-package or sibling message of the same name). See \
-                 buffa#135."
-            );
-            quote! { #[doc = #doc] }
-        };
+        let mod_doc = message::module_rename_doc(top_level_name, &mod_name);
         for p in msg_reg.json_ext {
             reg.json_ext.push(quote! { #mod_ident :: #p });
         }
@@ -3952,6 +4668,7 @@ fn generate_package(
     // element types, collected generation-wide and emitted into exactly one
     // package's `__buffa` module (empty for every package but the first).
     custom_elem_impls: &TokenStream,
+    output_names: &mut OutputNames,
     out: &mut Vec<GeneratedFile>,
 ) -> Result<(), CodeGenError> {
     // Registry paths are package-root-relative; `register_types` lives at
@@ -3959,6 +4676,18 @@ fn generate_package(
     // single `super::` prefix when emitted into the fn body.
     let mut reg = message::RegistryPaths::default();
     let mut root_reexports: Vec<message::ReexportCandidate> = Vec::new();
+
+    // Package-level types share one module whichever file declares them.
+    check_type_names(
+        current_package,
+        files.iter().flat_map(|file| {
+            file.message_type
+                .iter()
+                .filter_map(|m| m.name.as_deref())
+                .chain(file.enum_type.iter().filter_map(|e| e.name.as_deref()))
+        }),
+        &ctx.config.type_name_prefix,
+    )?;
 
     // Idiomatic imports: dry-run the package's generation once with the
     // registry collecting, so the set of package-root path references is
@@ -4010,12 +4739,14 @@ fn generate_package(
                         kind: GeneratedFileKind,
                         tokens: TokenStream,
                         section: &mut Vec<TokenStream>,
+                        output_names: &mut OutputNames,
                         out: &mut Vec<GeneratedFile>|
              -> Result<(), CodeGenError> {
                 if tokens.is_empty() {
                     return Ok(());
                 }
                 let name = format!("{stem}{suffix}.rs");
+                output_names.claim(&name, source.to_owned())?;
                 section.push(quote! { include!(#name); });
                 out.push(GeneratedFile {
                     name,
@@ -4030,6 +4761,7 @@ fn generate_package(
                 GeneratedFileKind::Owned,
                 pc.owned,
                 &mut sections.owned,
+                output_names,
                 out,
             )?;
             emit(
@@ -4037,6 +4769,7 @@ fn generate_package(
                 GeneratedFileKind::View,
                 pc.view,
                 &mut sections.view,
+                output_names,
                 out,
             )?;
             emit(
@@ -4044,6 +4777,7 @@ fn generate_package(
                 GeneratedFileKind::LazyView,
                 pc.lazy_view,
                 &mut sections.lazy_view,
+                output_names,
                 out,
             )?;
             emit(
@@ -4051,6 +4785,7 @@ fn generate_package(
                 GeneratedFileKind::Oneof,
                 pc.oneof,
                 &mut sections.oneof,
+                output_names,
                 out,
             )?;
             emit(
@@ -4058,6 +4793,7 @@ fn generate_package(
                 GeneratedFileKind::ViewOneof,
                 pc.view_oneof,
                 &mut sections.view_oneof,
+                output_names,
                 out,
             )?;
             emit(
@@ -4065,6 +4801,7 @@ fn generate_package(
                 GeneratedFileKind::Ext,
                 pc.ext,
                 &mut sections.ext,
+                output_names,
                 out,
             )?;
         }
@@ -4073,12 +4810,19 @@ fn generate_package(
 
     let reexport_block = surviving_root_reexports(ctx, files, &reg, root_reexports);
 
+    let mod_name = if ctx.config.file_per_package {
+        package_to_filename(current_package)
+    } else {
+        package_to_mod_filename(current_package)
+    };
+    let mod_source = if current_package.is_empty() {
+        "the unnamed package".to_owned()
+    } else {
+        format!("package {current_package}")
+    };
+    output_names.claim(&mod_name, mod_source)?;
     out.push(GeneratedFile {
-        name: if ctx.config.file_per_package {
-            package_to_filename(current_package)
-        } else {
-            package_to_mod_filename(current_package)
-        },
+        name: mod_name,
         package: current_package.to_string(),
         kind: GeneratedFileKind::PackageMod,
         content: generate_package_mod(
@@ -4100,8 +4844,7 @@ fn generate_package(
 }
 
 /// Names occupied at a package's root by real items: top-level messages,
-/// enums, message nested-types modules (deconflicted name, #135), and the
-/// `__buffa` sentinel itself.
+/// enums, message nested-types modules, and the `__buffa` sentinel itself.
 ///
 /// The package root is shared across every `.proto` file in the package, so
 /// the set is built from *all* of them. File-level extension consts live in
@@ -4122,7 +4865,6 @@ fn root_occupied_names(
             // The declared struct name carries the configured prefix; the
             // module name stays proto-derived.
             occupied.insert(ctx.config.prefixed_type_name(name));
-            // The actual module name (deconflicted from sub-packages, #135).
             occupied.insert(ctx.nested_module_name(package, name));
         }
         for e in &file.enum_type {
@@ -4510,6 +5252,104 @@ pub fn normalize_exclude_package(value: &str) -> Result<String, String> {
     Ok(pkg.to_string())
 }
 
+/// Normalize and validate the proto side of one `extern_path` mapping.
+///
+/// Trims whitespace, adds the leading dot if absent, drops one trailing dot,
+/// and rejects a name with an empty segment (`my..common`) or with a segment
+/// that is not a protobuf identifier (`my.common-name`). Such a name matches
+/// no type, so a typo would otherwise leave the mapping silently unused.
+/// `"."`, the catch-all, is returned as is.
+///
+/// The `protoc-gen-buffa` option parser and `buffa-build` both run entries
+/// through this function, so the two front ends accept the same names.
+///
+/// # Errors
+///
+/// Returns the user-facing message for a malformed name, quoting the name as
+/// given. The error is a plain `String` for the reason
+/// [`normalize_exclude_package`] gives.
+pub fn normalize_extern_path_proto_name(value: &str) -> Result<String, String> {
+    const EXPECTED: &str = "expected '.' or a dotted protobuf package or type name, \
+                            e.g. .my.pkg or .my.pkg.Type";
+    let given = value.trim();
+    if given == "." {
+        return Ok(given.to_string());
+    }
+    let name = given.strip_prefix('.').unwrap_or(given);
+    let name = name.strip_suffix('.').unwrap_or(name);
+    for segment in name.split('.') {
+        if segment.is_empty() {
+            return Err(format!(
+                "'extern_path' proto name '{given}' has an empty segment; {EXPECTED}"
+            ));
+        }
+        // protoc's identifier rule: a letter or `_`, then letters, digits or `_`.
+        let mut chars = segment.chars();
+        let starts_ok = chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == '_');
+        if !(starts_ok && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')) {
+            return Err(format!(
+                "'extern_path' proto name '{given}': segment '{segment}' is not a \
+                 protobuf identifier; {EXPECTED}"
+            ));
+        }
+    }
+    Ok(format!(".{name}"))
+}
+
+#[cfg(test)]
+mod extern_path_proto_name_tests {
+    use super::normalize_extern_path_proto_name as normalize;
+
+    #[test]
+    fn accepts_and_normalizes_valid_names() {
+        for (given, normalized) in [
+            (".", "."),
+            (".my.common", ".my.common"),
+            ("my.common", ".my.common"),
+            (".my.common.", ".my.common"),
+            (" my.v2.Type_1 ", ".my.v2.Type_1"),
+            ("._internal._Foo", "._internal._Foo"),
+        ] {
+            assert_eq!(normalize(given), Ok(normalized.to_string()), "{given:?}");
+        }
+    }
+
+    #[test]
+    fn empty_segment_error_quotes_the_name_as_given() {
+        for given in [
+            "",
+            "..",
+            "..my",
+            "my..common",
+            ".my.common..",
+            ".my.common..Shared",
+        ] {
+            let err = normalize(given).unwrap_err();
+            assert!(
+                err.contains(&format!("'{given}' has an empty segment")),
+                "{given:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_identifier_error_names_the_segment() {
+        for (given, segment) in [
+            ("my.123", "123"),
+            (".my.common-name.", "common-name"),
+            ("my.com mon", "com mon"),
+        ] {
+            let err = normalize(given).unwrap_err();
+            assert!(
+                err.contains(&format!("proto name '{given}': segment '{segment}'")),
+                "{given:?}: {err}"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod package_exclusion_tests {
     use super::package_is_excluded;
@@ -4627,32 +5467,48 @@ pub fn proto_path_to_stem(proto_path: &str) -> String {
 ///
 /// `name` must be a bare-sibling filename — the same convention buffa uses
 /// for its own `include!` calls, so it resolves relative to the stitcher
-/// without any `OUT_DIR` prefix. Names must not contain `"`, `\`, `/`, or
-/// newlines (the function `debug_assert!`s this in debug builds), and must
-/// not collide with any of buffa's own generated filenames for the same
-/// package (`<stem>.rs`, `<stem>.__view.rs`, etc.) — pick an unused suffix
-/// such as `<stem>.__myplugin.rs`.
+/// without any `OUT_DIR` prefix. Names must not contain `/` or `\`, must not
+/// be empty, `.` or `..`, and must not collide with any of buffa's own
+/// generated filenames for the same package (`<stem>.rs`, `<stem>.__view.rs`,
+/// etc.) — pick an unused suffix such as `<stem>.__myplugin.rs`. The name is
+/// written into the `include!` as an escaped string literal, as buffa's own
+/// include paths are.
 ///
 /// Companion files with no matching `PackageMod` (e.g. for a package buffa
 /// did not generate any output for) are still appended to `files` but no
 /// `include!` is emitted; the caller is responsible for wiring them up. If
 /// you don't expect orphans, check that every companion's `package` appears
 /// in `files` as a `PackageMod` after calling.
+///
+/// # Panics
+///
+/// Panics if a companion's `name` contains `/` or `\`, or is empty, `.` or
+/// `..`. Every name is checked before `files` is changed.
+#[track_caller]
 pub fn apply_companions(files: &mut Vec<GeneratedFile>, companions: Vec<GeneratedFile>) {
     for comp in &companions {
-        debug_assert!(
-            !comp.name.contains(['"', '\\', '/', '\n']),
-            "companion file name {:?} contains a character that would break \
-             the generated include!() literal or its bare-sibling resolution",
+        assert!(
+            !comp.name.contains(['/', '\\']),
+            "companion file name {:?} contains a path separator ('/' or '\\'); use a \
+             bare file name such as `<stem>.__myplugin.rs`, which include!() resolves \
+             next to the stitcher",
             comp.name
         );
+        assert!(
+            !matches!(comp.name.as_str(), "" | "." | ".."),
+            "companion file name {:?} is empty, `.` or `..`, which names a directory, \
+             not a file; use a bare file name such as `<stem>.__myplugin.rs`",
+            comp.name
+        );
+    }
+    for comp in &companions {
         if let Some(pkg_mod) = files
             .iter_mut()
             .find(|f| f.kind == GeneratedFileKind::PackageMod && f.package == comp.package)
         {
             pkg_mod
                 .content
-                .push_str(&format!("include!(\"{}\");\n", comp.name));
+                .push_str(&format!("include!({:?});\n", comp.name));
         }
     }
     files.extend(companions);
@@ -4662,9 +5518,11 @@ pub fn apply_companions(files: &mut Vec<GeneratedFile>, companions: Vec<Generate
 #[derive(Debug, Clone, thiserror::Error)]
 #[non_exhaustive]
 pub enum CodeGenError {
-    /// A required field was absent in a descriptor.
+    /// A required field was absent in a descriptor, or a message or enum name
+    /// was empty.
     ///
-    /// The `&'static str` names the missing field for diagnostics.
+    /// The string is the descriptor field, such as `message.name` or
+    /// `field.type_name`.
     #[error("missing required descriptor field: {0}")]
     MissingField(&'static str),
     /// A resolved type path string could not be parsed as a Rust type.
@@ -4690,6 +5548,33 @@ pub enum CodeGenError {
     /// A requested file was not present in the descriptor set.
     #[error("file_to_generate '{0}' not found in descriptor set")]
     FileNotFound(String),
+    /// Two generated files would be written to the same output path. A
+    /// content file is named after its `.proto` path with `/` replaced by
+    /// `.`, so `foo/bar.proto` and `foo.bar.proto` both produce `foo.bar.rs`;
+    /// a package's module file is `<package>.mod.rs`, which is also the
+    /// content file of `foo/mod.proto` in package `foo`.
+    ///
+    /// Resolve by renaming a proto file (the only one involved, when the
+    /// other source is a package), or by setting
+    /// [`CodeGenConfig::file_per_package`], which emits one file per package
+    /// and no per-proto content files.
+    #[error(
+        "output file name conflict: {first_source} and {second_source} both \
+         generate '{file_name}'; rename a proto file so that the output names \
+         differ, or enable file_per_package"
+    )]
+    OutputFileNameConflict {
+        /// The output path that both inputs map to.
+        file_name: String,
+        /// The input that generated the path first: the `.proto` file path
+        /// as its descriptor names it for a content file, or
+        /// `package <name>` (`the unnamed package` for a file that declares
+        /// no package) for a package's module file.
+        first_source: String,
+        /// The input that generated the path second, in the same form as
+        /// `first_source`.
+        second_source: String,
+    },
     /// Unexpected descriptor state (e.g. a map entry or oneof that cannot be
     /// resolved to a known descriptor field).
     #[error("codegen error: {0}")]
@@ -4717,6 +5602,79 @@ pub enum CodeGenError {
         name_a: String,
         name_b: String,
         module_name: String,
+    },
+    /// Two oneofs of one message produce the same Rust enum name after
+    /// PascalCase conversion and keyword escaping (e.g., `foo_bar` and
+    /// `foo__bar` both become `FooBar`; `self` and `self_` both become
+    /// `Self_`). Resolve by renaming one of the oneofs. A oneof's name is in
+    /// neither the wire format nor JSON, so the rename changes generated
+    /// code only.
+    #[error(
+        "oneof enum name conflict in message '{message_name}': oneofs \
+         '{first_oneof}' and '{second_oneof}' both map to Rust enum '{rust_name}'; \
+         rename one of them"
+    )]
+    OneofEnumNameConflict {
+        /// Fully-qualified proto name of the message, without a leading dot.
+        message_name: String,
+        /// Proto name of the oneof declared first.
+        first_oneof: String,
+        /// Proto name of the oneof declared second.
+        second_oneof: String,
+        /// The Rust enum name that both oneofs map to.
+        rust_name: String,
+    },
+    /// Two members of one oneof produce the same Rust variant name after
+    /// PascalCase conversion and keyword escaping (e.g., `foo` and `foo_`
+    /// both become `Foo`; `foo_bar` and `foo__bar` both become `FooBar`;
+    /// `self` and `self_` both become `Self_`). Resolve by renaming one of
+    /// the members. A member's name is its default JSON and text-format
+    /// name, so the rename changes those too unless the field sets a
+    /// `json_name`; the wire format is unaffected.
+    #[error(
+        "oneof variant name conflict in message '{message_name}': members \
+         '{first_field}' and '{second_field}' of oneof '{oneof_name}' both map \
+         to Rust variant '{rust_name}'; rename one of them"
+    )]
+    OneofVariantNameConflict {
+        /// Fully-qualified proto name of the message, without a leading dot.
+        message_name: String,
+        /// Proto name of the oneof that declares both members.
+        oneof_name: String,
+        /// Proto name of the member declared first.
+        first_field: String,
+        /// Proto name of the member declared second.
+        second_field: String,
+        /// The Rust variant name that both members map to.
+        rust_name: String,
+    },
+    /// Two types, each a message or an enum, declared at package level in
+    /// one package or nested in one message, produce the same Rust type
+    /// name. With an empty [`CodeGenConfig::type_name_prefix`], a type named
+    /// after a Rust keyword (`type`, `Self`), or after a primitive type that
+    /// generated code uses (`bool`, `str`, `u8`, `usize`, `i32`, `i64`,
+    /// `u32`, `u64`, `f32`, `f64`), is generated with a trailing `_`, so
+    /// `bool` and `bool_` both become `bool_`.
+    ///
+    /// Resolve by renaming one of the types, which changes its full name and
+    /// its `Any` type URL, or by setting a prefix: with prefix `Pb` the two
+    /// types are `Pbbool` and `Pbbool_`.
+    #[error(
+        "type name conflict in '{scope}': '{first_type}' and '{second_type}' \
+         both map to Rust type '{rust_name}'; rename one of them"
+    )]
+    TypeNameConflict {
+        /// Fully-qualified proto name of the package or message that
+        /// declares both types, without a leading dot. Empty for a
+        /// package-level conflict in a file that declares no package.
+        scope: String,
+        /// Proto simple name of the type visited first: within each file,
+        /// messages in declaration order, then enums.
+        first_type: String,
+        /// Proto simple name of the type visited second.
+        second_type: String,
+        /// The Rust type name that both map to.
+        rust_name: String,
     },
     /// A proto package segment, message name, or file-level enum name
     /// would emit a Rust item matching the reserved sentinel `__buffa`.
@@ -4752,11 +5710,14 @@ pub enum CodeGenError {
     MessageSetNotSupported { message_name: String },
     /// A custom attribute string configured via [`CodeGenConfig::type_attributes`],
     /// [`CodeGenConfig::field_attributes`], [`CodeGenConfig::message_attributes`],
-    /// [`CodeGenConfig::enum_attributes`], or [`CodeGenConfig::oneof_attributes`]
-    /// could not be parsed as a Rust attribute.
+    /// [`CodeGenConfig::enum_attributes`], [`CodeGenConfig::oneof_attributes`],
+    /// or [`CodeGenConfig::oneof_struct_field_attributes`] is not one or more
+    /// outer `#[...]` attributes. An empty string, an inner attribute
+    /// `#![...]` and a string with any token outside an attribute are all
+    /// rejected, whether or not the rule's path matches a generated item.
     #[error(
-        "invalid custom attribute for path '{path}': '{attribute}' is not a valid \
-         Rust attribute ({detail})"
+        "invalid custom attribute for path '{path}': '{attribute}' must be one or \
+         more outer `#[...]` attributes ({detail})"
     )]
     InvalidCustomAttribute {
         path: String,
@@ -4772,6 +5733,29 @@ pub enum CodeGenError {
          and digits only)"
     )]
     InvalidTypeNamePrefix { prefix: String },
+    /// Two fields of one message, in a file being generated, have the same
+    /// field number. protoc rejects such a message, so the descriptor was
+    /// built in code or changed after protoc wrote it.
+    ///
+    /// Generated code for it would write both fields with one field number
+    /// and decode every record with that number into one of them, so the
+    /// error is returned whichever codec is selected.
+    #[error(
+        "duplicate field number in message '{message_name}': fields '{first_field}' and \
+         '{second_field}' are both numbered {number}; protoc rejects this, so renumber one of \
+         them in the code or tool that built the descriptor"
+    )]
+    DuplicateFieldNumber {
+        /// The message's full name, without a leading dot.
+        message_name: String,
+        /// The name of the field declared first.
+        first_field: String,
+        /// The name of the field declared second.
+        second_field: String,
+        /// The number both fields have, as the descriptor gives it. It may be
+        /// outside the valid range for a field number.
+        number: i32,
+    },
 }
 
 #[cfg(test)]

@@ -30,7 +30,7 @@ The Rust ecosystem lacks an actively maintained, pure-Rust library that supports
 
 - **Runtime reflection.** `buffa-descriptor` (under the `reflect` feature) provides `DescriptorPool` and `DynamicMessage` for schema-driven encode, decode, and JSON without generated code — plus extensions, custom-option access, `Any` pack/unpack, and symbol→file lookup for gRPC server reflection. Generated types implement the same `ReflectMessage` trait directly (vtable mode), so `foo.reflect()` borrows in place and a CEL evaluator, transcoding gateway, or generic interceptor treats typed and dynamic messages uniformly — without a re-encode round-trip. See [Reflection](#reflection) for the cost relative to generated code.
 
-- **`no_std` + `alloc`.** The core runtime works without `std`, including JSON serialization via serde. Enabling `std` adds `std::io` integration, `std::time` conversions, and thread-local JSON parse options.
+- **`no_std` + `alloc`.** The core runtime works without `std`, including JSON serialization via serde. Enabling `std` adds `std::io` integration, `SystemTime` conversions, and thread-local JSON parse options. `Duration` conversions use `core::time::Duration` and work without `std`.
 
 ## Wire formats
 
@@ -47,7 +47,7 @@ buffa supports **binary**, **JSON**, and **text** protobuf encodings:
 These are intentionally out of scope:
 
 - **Proto2 optional-field getter methods** — `[default = X]` on `optional` fields does not generate `fn field_name(&self) -> T` unwrap-to-default accessors. Custom defaults are applied only to `required` fields via `impl Default`. Optional fields are `Option<T>`; use pattern matching or `.unwrap_or(X)`.
-- **Scoped `JsonParseOptions` in `no_std`** — serde's `Deserialize` trait has no context parameter, so runtime options must be passed through ambient state. In `std` builds, [`with_json_parse_options`] provides per-closure, per-thread scoping via a thread-local. In `no_std` builds, [`set_global_json_parse_options`] provides process-wide set-once configuration via a global atomic. The two APIs are mutually exclusive. The `no_std` global supports singular-enum accept-with-default but not repeated/map container filtering (which requires scoped strict-mode override).
+- **Scoped `JsonParseOptions` in `no_std`** — serde's `Deserialize` trait has no context parameter, so runtime options must be passed through ambient state. In `std` builds, [`with_json_parse_options`] provides per-closure, per-thread scoping via a thread-local. In `no_std` builds, [`set_global_json_parse_options`] provides process-wide set-once configuration via a global atomic. The two APIs are mutually exclusive and take the same options; in `no_std` the options are fixed for the process and cannot vary between parse calls.
 
 [`with_json_parse_options`]: https://docs.rs/buffa/latest/buffa/json/fn.with_json_parse_options.html
 [`set_global_json_parse_options`]: https://docs.rs/buffa/latest/buffa/json/fn.set_global_json_parse_options.html
@@ -165,6 +165,7 @@ let decoded: MyMessage = serde_json::from_str(&json).unwrap();
 | `buffa` | Core runtime: `Message` trait, wire format codec, `no_std` support |
 | `buffa-types` | Well-known types: Timestamp, Duration, Any, Struct, Api, Type, wrappers, etc. |
 | `buffa-descriptor` | Protobuf descriptor types (`FileDescriptorProto`, `DescriptorProto`, ...) |
+| `buffa-proto-options` | buffa's custom options (`buffa/ext/options.proto`) and their Rust types |
 | `buffa-codegen` | Code generation from protobuf descriptors |
 | `buffa-build` | `build.rs` helper for invoking codegen via `protoc` |
 | `buffa-remote-derive` | Derive macros implementing the pluggable owned-type traits for newtypes over foreign types |
@@ -382,7 +383,7 @@ buffa passes the protobuf binary and JSON conformance test suite (v33.5, edition
 |---|---|
 | Proto2 + proto3 | v21.12 |
 | Editions 2023 | v27.0 |
-| Editions 2024 | v33.0 |
+| Editions 2024 | v32.0 |
 
 Note that Linux distro packages (Debian Bookworm, Ubuntu 24.04) ship protoc v21.12, which does not support editions. Install protoc v27+ from [GitHub releases](https://github.com/protocolbuffers/protobuf/releases) or use buf if you need editions support.
 
@@ -390,7 +391,7 @@ Compatibility is tested against protoc v21.12, v22.5, v25.5, v27.3, v29.5, and v
 
 ## Minimum supported Rust version
 
-The current MSRV is **1.75**.
+The current MSRV is **1.75**. The opt-in `CodecStrategy::Table` generates code that needs Rust 1.77 (see [Smaller generated code](docs/guide.md#smaller-generated-code-codec_strategy)); `buffa-build` returns an error on an older compiler when it is requested.
 
 buffa is a foundational codec crate, so its `rust-version` is set to the lowest toolchain the released code actually compiles on, not to a calendar target. CI verifies the workspace builds at the MSRV and at stable on every change. With cargo's MSRV-aware resolver (`resolver = "3"`, Rust 1.84+), a downstream project on an older toolchain will automatically resolve to the newest buffa release whose `rust-version` fits — so an accurate declaration matters more than a conservative one.
 
