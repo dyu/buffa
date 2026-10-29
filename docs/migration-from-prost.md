@@ -127,6 +127,8 @@ This is the biggest API change. Prost uses `Option<Box<M>>`, which requires expl
 +let addr = msg.address.ok_or_else(|| Error::missing("address"))?;  // same
 ```
 
+`==` on a `MessageField` includes presence, as it does on prost's `Option<Box<M>>`: an unset field differs from one set to `M::default()`.
+
 ## 4. Enum fields
 
 Prost represents all enum fields as `i32`. Buffa uses `EnumValue<E>` for open enums (proto3 default) and bare `E` for closed enums (proto2).
@@ -176,6 +178,14 @@ For proto2 closed enums, Buffa follows closed-enum semantics by default and rout
 -let len = msg.encoded_len();
 +let len = msg.encoded_len() as usize;
 ```
+
+### Map entries
+
+prost leaves a map entry's key or value out when it holds the default; buffa writes both, as the C++ and Java runtimes do. Both decode the same, but the bytes differ. If stored or hashed map encodings must not change, turn on `.map_entries_omit_defaults(true)` to leave a default key or value out as prost does, and keep the entry order with `.map_type(buffa_build::MapRepr::BTreeMap)` where prost used `btree_map`. The option removes this difference, except for the message values described in the next paragraph. Other differences remain, for example: outside a map, a proto3 `float` or `double` field without `optional` that is `-0.0` is written by buffa and not by prost, and buffa writes back the [unknown fields](#unknown-field-preservation) it read.
+
+The option leaves out what a missing field decodes to: zero, `false`, empty, an open enum's 0, a closed enum's first value, and a message value that encodes to nothing. As with prost, a `-0.0` float value is left out and decodes as `0.0`. prost leaves out a message value equal to its default, so a value that equals its default but still encodes a field, such as a `required` field at its default or a float field holding `-0.0`, is written by buffa and not by prost.
+
+It applies to the owned, view and lazy view encoders of the messages generated with it. A lazy view keeps its singular and repeated message fields undecoded and writes them as they were read, so map entries inside them keep the encoding they arrived with, and every encoder writes entries kept as unknown fields as they were read. A value of an enum made open with `open_enums_in` is left out at 0, which a missing open enum decodes to, where prost leaves out its first value; the two differ only for an enum whose first value is not 0, which protoc rejects as a map value, so the case can occur only with a descriptor set that another tool built. Each crate's types encode as that crate was generated; `google.protobuf.Struct`, the well-known type with a map field, comes from `buffa-types` and writes both fields, and so does `DynamicMessage`. `protoc-gen-buffa` has no `map_type` option, so through the plugin a map with several entries keeps `HashMap` order. With `CodecStrategy::Table`, messages with a map field keep the unrolled codec, and a `codec_strategy_in` rule that selects the table for such a message by its exact path is an error.
 
 ## 6. Decoding API
 
@@ -289,11 +299,13 @@ The buffa equivalent of each prost-build feature, or a note that there is none:
 
 | prost feature | buffa status |
 |---------------|-------------|
-| `btree_map(&[...])` | Supported. `.map_type(buffa_build::MapRepr::BTreeMap)` for all, or `.map_type_in(buffa_build::MapRepr::BTreeMap, &[...])` for specific fields. Paths must be fully qualified with a leading dot (`".my_pkg.MyMessage.items"`); prost's suffix paths (`"items"`, `"MyMessage.items"`) are not supported. A path without the leading dot matches no field, and buffa reports no error. |
-| `bytes(&[...])` | Supported. `.use_bytes_type()` for all, or `.use_bytes_type_in(&[...])` for specific fields. Paths need the leading dot, as for `map_type_in`. |
+| `btree_map(&[...])` | Supported. `.map_type(buffa_build::MapRepr::BTreeMap)` for all, or `.map_type_in(buffa_build::MapRepr::BTreeMap, &[...])` for specific fields. Paths are fully qualified (`".my_pkg.MyMessage.items"`), and the leading dot is optional. prost's suffix paths (`"items"`, `"MyMessage.items"`) are not supported: `"items"` is read as `".items"`, matches no field, and produces a build warning. |
+| map entry encoding (default key or value left out) | Opt-in: `.map_entries_omit_defaults(true)`. See [Map entries](#map-entries). |
+| `bytes(&[...])` | Supported. `.use_bytes_type()` for all, or `.use_bytes_type_in(&[...])` for specific fields. Paths are matched as for `map_type_in`. |
 | `extern_path(proto, rust)` | Supported. Same API, both package-level (`.extern_path(".pkg", "::crate")`) and per-type (`.extern_path(".google.protobuf.Timestamp", "::pbjson_types::Timestamp")`) mappings. A per-type mapping to a non-buffa crate requires `.generate_views(false)`, or map to a buffa-generated crate instead — see [External type paths](guide.md#external-type-paths). |
 | `type_attribute(path, attr)` | Supported. Same API, plus `message_attribute` / `enum_attribute` / `oneof_attribute` for narrower targeting. (For serde, prefer `generate_json(true)`, which emits the proto3-canonical JSON impls.) |
-| `field_attribute(path, attr)` | Supported. Same API. |
+| `field_attribute(path, attr)` | Supported. Same API, with one difference: on a oneof's path (`".pkg.Msg.my_oneof"`), prost-build puts the attribute on the struct field holding the oneof and on every variant, buffa on the variants only. Use `oneof_struct_field_attribute` for the struct field. |
+| `skip_debug(&[...])` | Supported. `buffa_build::Config::skip_debug(&[...])` omits the generated `Debug` for matching messages and their oneof enums, so you can write your own. Four differences from prost-build. Paths must be fully qualified (`".my_pkg.Uuid4"`): a prost suffix path (`"Uuid4"`) matches nothing and produces a build warning. Repeated calls accumulate, where prost-build's replace the list. An enum loses its `Debug` only when a path is its exact name, and then needs a hand-written impl, because `buffa::Enumeration` requires `Debug`. View types keep their generated `Debug`, so `skip_debug(&["."])` removes the impls of owned messages and their oneof enums only. |
 | `service_generator(...)` | Not supported. Services codegen is planned. |
 | `#[derive(prost::Message)]` | No derive; generate from `.proto` or use `extern_path` for an existing Rust type. See [Where is `#[derive(Message)]`?](#where-is-derivemessage). |
 | `prost::Name` trait | `buffa::MessageName` — same shape (`PACKAGE`, `NAME`, plus `FULL_NAME` and `TYPE_URL`), but all four are `&'static str` consts computed at codegen time rather than runtime `format!` calls. Replace `M::full_name()` with `M::FULL_NAME` and `M::type_url()` with `M::TYPE_URL`. Implemented for both owned messages and view types. |

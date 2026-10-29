@@ -83,6 +83,8 @@ pub const DEFAULT_UNKNOWN_FIELD_LIMIT: usize = 1_000_000;
 ///
 /// The textproto parser defaults to this same constant, raised through
 /// [`TextDecoder::with_element_memory_limit`](crate::text::TextDecoder::with_element_memory_limit).
+/// `buffa_descriptor`'s reflective JSON parser defaults to it too, raised
+/// through `buffa_descriptor::DynamicMessageSeed::with_element_memory_limit`.
 ///
 /// 32 MiB of elements is far more than a realistic message carries, and sits
 /// alongside what [`DEFAULT_UNKNOWN_FIELD_LIMIT`] already permits (~38 MiB of
@@ -211,6 +213,22 @@ impl<'a> DecodeContext<'a> {
     #[must_use]
     pub fn remaining_element_memory(&self) -> Option<usize> {
         self.element_memory_remaining.map(core::cell::Cell::get)
+    }
+
+    /// Spend what is left of the element-memory budget, so that every later
+    /// nonzero charge on this context fails.
+    ///
+    /// A caller that drops a value after
+    /// [`ElementMemoryLimitExceeded`](DecodeError::ElementMemoryLimitExceeded)
+    /// and keeps decoding with the same context uses this to make the first
+    /// value that does not fit the last one it reads: a failed charge leaves
+    /// the budget unchanged, so a smaller value after it could otherwise
+    /// still be charged. The bound on the total does not depend on this
+    /// call; it comes from never refunding a charge.
+    pub(crate) fn exhaust_element_memory(&self) {
+        if let Some(cell) = self.element_memory_remaining {
+            cell.set(0);
+        }
     }
 
     /// Charge `bytes` against the shared element-memory budget.
@@ -1160,6 +1178,14 @@ pub trait MessageName {
 /// be bounded needs a bound imposed by the caller, for example by capping the
 /// input length before parsing.
 ///
+/// One JSON path applies an element-memory limit of its own:
+/// `buffa_descriptor`'s reflective parser (`DynamicMessage::from_json`)
+/// charges the repeated elements and map entries it builds against a limit
+/// that defaults to [`DEFAULT_ELEMENT_MEMORY_LIMIT`] and is changed with
+/// `buffa_descriptor::DynamicMessageSeed::with_element_memory_limit`, not
+/// here. The parser also charges that limit for the buffer it reads a
+/// `google.protobuf.Any` payload into, until it has decoded the payload.
+///
 /// # Examples
 ///
 /// ```no_run
@@ -1336,9 +1362,12 @@ impl DecodeOptions {
     /// only. The textproto parser applies the same default through its own
     /// knob,
     /// [`TextDecoder::with_element_memory_limit`](crate::text::TextDecoder::with_element_memory_limit).
-    /// The same message decoded from JSON is not charged against this
-    /// budget, and the amplification it guards against is very nearly as large
-    /// there — `{}` is three JSON bytes for the same element footprint.
+    /// The same message decoded from JSON into a generated type is not
+    /// charged against this budget, and the amplification it guards against
+    /// is very nearly as large there — `{}` is three JSON bytes for the same
+    /// element footprint. The reflective JSON parser in `buffa_descriptor`
+    /// applies the same default, changed with
+    /// `buffa_descriptor::DynamicMessageSeed::with_element_memory_limit`.
     ///
     /// Default: 32 MiB ([`DEFAULT_ELEMENT_MEMORY_LIMIT`]).
     #[must_use]
@@ -1488,16 +1517,18 @@ impl DecodeOptions {
     /// Decode a zero-copy view from a byte slice.
     ///
     /// Enforces `max_message_size` on the input, and passes the recursion
-    /// limit and unknown-field limit to the view decoder (views charge the
-    /// unknown-field limit per field, including fields nested in unknown
-    /// groups — see
+    /// limit, unknown-field limit, and element-memory budget to the view
+    /// decoder (views charge the unknown-field limit per field, including
+    /// fields nested in unknown groups — see
     /// [`with_unknown_field_limit`](Self::with_unknown_field_limit)).
     ///
     /// # Errors
     ///
     /// Returns [`DecodeError::MessageTooLarge`] for oversized input, or any
-    /// error from the view decoder (malformed wire data, recursion limit,
-    /// unknown-field limit).
+    /// error from the view decoder (malformed wire data,
+    /// [`DecodeError::RecursionLimitExceeded`],
+    /// [`DecodeError::UnknownFieldLimitExceeded`], or
+    /// [`DecodeError::ElementMemoryLimitExceeded`]).
     pub fn decode_view<'a, V: crate::view::MessageView<'a>>(
         &self,
         buf: &'a [u8],

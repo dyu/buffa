@@ -361,7 +361,7 @@ fn collect_variant_info(
         })
         .collect();
 
-    fields
+    let variants: Vec<VariantInfo> = fields
         .iter()
         .map(|field| {
             let proto_name = field
@@ -446,7 +446,25 @@ fn collect_variant_info(
                 debug_redact: crate::message::is_debug_redacted(field),
             })
         })
-        .collect()
+        .collect::<Result<_, _>>()?;
+
+    // `oneof_variant_ident` is lossy (`foo` / `foo_`, `foo_bar` / `foo__bar`,
+    // `self` / `self_`), so two members can map to one variant. Every
+    // member's name was checked above, so `unwrap_or_default` never fires.
+    let mut seen = std::collections::HashMap::<String, &str>::new();
+    for (field, variant) in fields.iter().zip(&variants) {
+        let proto_name = field.name.as_deref().unwrap_or_default();
+        if let Some(first_field) = seen.insert(variant.variant_ident.to_string(), proto_name) {
+            return Err(CodeGenError::OneofVariantNameConflict {
+                message_name: proto_fqn.to_string(),
+                oneof_name: oneof_name.to_string(),
+                first_field: first_field.to_string(),
+                second_field: proto_name.to_string(),
+                rust_name: variant.variant_ident.to_string(),
+            });
+        }
+    }
+    Ok(variants)
 }
 
 /// Generate a Rust enum for a protobuf oneof.
@@ -568,7 +586,7 @@ pub fn generate_oneof_enum(
             };
             // From<T> for Oneof — always legal (Oneof is local in T0 position).
             let from_oneof = quote! {
-                impl From<#ty> for #rust_enum_ident {
+                impl ::core::convert::From<#ty> for #rust_enum_ident {
                     fn from(v: #ty) -> Self {
                         Self::#ident(#wrapped)
                     }
@@ -581,7 +599,7 @@ pub fn generate_oneof_enum(
                 quote! {}
             } else {
                 quote! {
-                    impl From<#ty> for ::core::option::Option<#rust_enum_ident> {
+                    impl ::core::convert::From<#ty> for ::core::option::Option<#rust_enum_ident> {
                         fn from(v: #ty) -> Self {
                             Self::Some(#rust_enum_ident::from(v))
                         }
@@ -631,8 +649,13 @@ pub fn generate_oneof_enum(
     // instead of their payload. The `Debug` derive is swapped for a manual
     // impl only when at least one variant is redacted, so unaffected oneofs
     // keep byte-identical output.
+    //
+    // A `skip_debug` rule on the owning message leaves the oneof's `Debug` to
+    // the consuming crate as well.
     let any_redacted = variants_info.iter().any(|v| v.debug_redact);
-    let (debug_derive, debug_impl) = if any_redacted {
+    let (debug_derive, debug_impl) = if ctx.skip_debug(proto_fqn) {
+        (quote! { #[derive(Clone, PartialEq)] }, quote! {})
+    } else if any_redacted {
         let placeholder = crate::message::DEBUG_REDACT_PLACEHOLDER;
         let arms: Vec<TokenStream> = variants_info
             .iter()
@@ -780,7 +803,7 @@ fn generate_oneof_serialize(
 
     quote! {
         impl ::serde::Serialize for #enum_ident {
-            fn serialize<S: ::serde::Serializer>(&self, s: S) -> ::core::result::Result<S::Ok, S::Error> {
+            fn serialize<__S: ::serde::Serializer>(&self, s: __S) -> ::core::result::Result<__S::Ok, __S::Error> {
                 use ::serde::ser::SerializeMap;
                 let mut map = s.serialize_map(Some(1))?;
                 match self {
@@ -892,7 +915,7 @@ pub(crate) fn oneof_variant_deser_arm(
                 struct _DeserSeed;
                 impl<'de> ::serde::de::DeserializeSeed<'de> for _DeserSeed {
                     type Value = #variant_type;
-                    fn deserialize<D: ::serde::Deserializer<'de>>(self, d: D) -> ::core::result::Result<#variant_type, D::Error> {
+                    fn deserialize<__D: ::serde::Deserializer<'de>>(self, d: __D) -> ::core::result::Result<#variant_type, __D::Error> {
                         #helper::deserialize(d)
                     }
                 }
@@ -934,11 +957,8 @@ pub(crate) fn oneof_variant_deser_arm(
 /// keyword-escaped like [`oneof_variant_ident`], so a oneof named `self`,
 /// `self_` or `_self` becomes `Self_`.
 ///
-/// No collision check — oneof enums live in the dedicated
-/// `__buffa::oneof::<msg>::` tree where they cannot collide with nested
-/// types, nested enums, or view structs. Two sibling oneofs whose names
-/// PascalCase alike (`foo_bar` and `foo__bar`, or `self` and `self_`) do
-/// produce the same ident; that is not diagnosed.
+/// The conversion is lossy, so sibling collisions are checked by
+/// [`resolve_oneof_idents`].
 fn oneof_enum_ident(oneof_name: &str) -> proc_macro2::Ident {
     crate::idents::make_field_ident(&to_pascal_case(oneof_name))
 }
@@ -946,13 +966,15 @@ fn oneof_enum_ident(oneof_name: &str) -> proc_macro2::Ident {
 /// Compute oneof enum identifiers for all non-synthetic oneofs in a message.
 ///
 /// Returns a map from oneof declaration index to its Rust enum `Ident`.
-/// Synthetic oneofs (proto3 `optional`) are omitted. Infallible: oneof
-/// enums live in the `__buffa::oneof::` tree where collisions with
-/// nested types are structurally impossible.
+/// Synthetic oneofs (proto3 `optional`) are omitted. Returns
+/// [`CodeGenError::OneofEnumNameConflict`] when two of the remaining oneofs
+/// map to the same Rust enum identifier.
 pub(crate) fn resolve_oneof_idents(
     msg: &DescriptorProto,
-) -> std::collections::HashMap<usize, Ident> {
+    message_name: &str,
+) -> Result<std::collections::HashMap<usize, Ident>, CodeGenError> {
     let mut result = std::collections::HashMap::new();
+    let mut seen = std::collections::HashMap::<String, String>::new();
     for (idx, oneof) in msg.oneof_decl.iter().enumerate() {
         let has_real_fields = msg.field.iter().any(|f| {
             crate::impl_message::is_real_oneof_member(f) && f.oneof_index == Some(idx as i32)
@@ -961,10 +983,21 @@ pub(crate) fn resolve_oneof_idents(
             continue;
         }
         if let Some(oneof_name) = &oneof.name {
-            result.insert(idx, oneof_enum_ident(oneof_name));
+            let enum_ident = oneof_enum_ident(oneof_name);
+            let rust_name = enum_ident.to_string();
+            if let Some(first_oneof) = seen.get(&rust_name) {
+                return Err(CodeGenError::OneofEnumNameConflict {
+                    message_name: message_name.to_string(),
+                    first_oneof: first_oneof.clone(),
+                    second_oneof: oneof_name.clone(),
+                    rust_name,
+                });
+            }
+            seen.insert(rust_name, oneof_name.clone());
+            result.insert(idx, enum_ident);
         }
     }
-    result
+    Ok(result)
 }
 
 /// Build the Rust variant identifier for a oneof field.

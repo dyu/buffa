@@ -630,14 +630,12 @@ pub mod proto_enum {
 
 /// Try to decode a `serde_json::Value` as a closed enum via [`Enumeration`].
 ///
-/// When `ignore_unknown_enum_values` is active, returns `Ok(None)` for any
-/// value that fails to decode, so the caller can drop the entry from its
-/// container (or leave the optional unset). Strict mode propagates the
-/// error. The lenient catch-all (any error → `None`, not just
-/// unknown-variant) matches [`try_deserialize_enum`]'s behaviour for open
-/// enums — if you are tightening this to only swallow unknown-variant
-/// errors, tighten the open-enum path in the same change so the two stay
-/// consistent.
+/// When `ignore_unknown_enum_values` is active, returns `Ok(None)` for a
+/// [`ClosedEnumError::Unknown`] value, so the caller can drop the entry from
+/// its container (or leave the optional unset). A
+/// [`ClosedEnumError::Malformed`] value is an error in both modes. Strict
+/// mode propagates every error. [`try_deserialize_enum`] filters unknown
+/// names for open enums.
 ///
 /// Why not [`try_deserialize_enum::<E>`]? It routes through
 /// `serde_json::from_value::<E>()`, which requires `E: DeserializeOwned` —
@@ -646,64 +644,70 @@ pub mod proto_enum {
 /// type lives in an externally-generated crate built *without* json (e.g.
 /// `google.protobuf.FieldDescriptorProto.Type` from `buffa-descriptor`)
 /// would refuse to compile. Decoding directly via the [`Enumeration`] trait
-/// removes the impl requirement, and is exactly the dispatch the
-/// codegen-emitted `Deserialize` impl performs anyway — `from_proto_name`
-/// for strings, `from_i32` after range-check for integers, default for
-/// `null` — so behaviour is unchanged for enums that *do* have one.
+/// removes the impl requirement. It uses `from_proto_name` for strings and
+/// `from_i32` after range-checking integers. Null is handled by the optional
+/// field helper before this call and rejected inside containers.
 ///
-/// Unlike [`try_deserialize_enum`], lenient filtering works in both `std`
-/// and `no_std` builds: there's no inner deserialize whose own lenient
-/// handling could mask the unknown-value case, so no scoped strict-mode
-/// override is needed. (Open-enum containers via [`try_deserialize_enum`]
-/// still need the `std` thread-local override and so don't filter under
-/// `no_std`.)
+/// Lenient filtering works in both `std` and `no_std` builds. Unlike the
+/// open-enum helper, this path decodes directly through [`Enumeration`], so
+/// it never needs a scoped strict-mode override.
 ///
 /// [`Enumeration`]: crate::Enumeration
 #[inline]
 fn try_deserialize_closed_enum<E: crate::Enumeration + Default>(
     raw: &serde_json::Value,
 ) -> Result<Option<E>, serde_json::Error> {
-    let result = decode_closed_enum_strict::<E>(raw);
-    match result {
+    match decode_closed_enum::<E>(raw) {
         Ok(e) => Ok(Some(e)),
-        Err(_) if crate::json::ignore_unknown_enum_values() => Ok(None),
-        Err(e) => Err(e),
+        Err(ClosedEnumError::Unknown(_)) if crate::json::ignore_unknown_enum_values() => Ok(None),
+        Err(ClosedEnumError::Unknown(e) | ClosedEnumError::Malformed(e)) => Err(e),
     }
 }
 
-/// Strict closed-enum decode of a buffered `serde_json::Value`, bound only
-/// on [`Enumeration`]. Any failure — unknown variant, out-of-range integer,
-/// wrong JSON type — is an error. [`try_deserialize_closed_enum`] applies
-/// lenient filtering on top.
+/// Why a buffered JSON value is not a variant of a closed enum.
+enum ClosedEnumError {
+    /// A name, or a number in `i32` range, that the enum does not declare.
+    /// Lenient parsing drops the value.
+    Unknown(serde_json::Error),
+    /// Null, a float, a number outside `i32`, a bool, an object or an array. An
+    /// error whether or not parsing is lenient.
+    Malformed(serde_json::Error),
+}
+
+/// Closed-enum decode of a buffered `serde_json::Value`, bound only on
+/// [`Enumeration`]. Every failure is an error here.
 ///
-/// Mirrors the codegen-emitted `impl Deserialize for SomeEnum` (see
-/// `buffa-codegen/src/enumeration.rs`):
-///
-/// | JSON | Codegen Visitor | This fn |
-/// |---|---|---|
-/// | `null` | `visit_unit` → default | default |
-/// | `"NAME"` | `visit_str` → `from_proto_name` | `from_proto_name` |
-/// | integer | `visit_i64`/`visit_u64` → range-check → `from_i32` | range-check → `from_i32` |
-/// | float, bool, object, array | no Visitor method → serde type error | type error |
+/// Accepts enum names and integer values. The optional-field helper handles
+/// null before calling this function; repeated elements and map values must
+/// reject it, even when unknown enum values are ignored.
 ///
 /// [`Enumeration`]: crate::Enumeration
-fn decode_closed_enum_strict<E: crate::Enumeration + Default>(
+fn decode_closed_enum<E: crate::Enumeration + Default>(
     raw: &serde_json::Value,
-) -> Result<E, serde_json::Error> {
-    use serde::de::Error as _;
+) -> Result<E, ClosedEnumError> {
+    use serde::de::{Error as _, Unexpected};
     use serde_json::Value;
 
+    // The error names the value's JSON type and leaves its contents out: an
+    // object or array here can be as large as the input.
+    let malformed = |unexpected: Unexpected<'_>| {
+        ClosedEnumError::Malformed(serde_json::Error::invalid_type(
+            unexpected,
+            &"a protobuf enum name string or integer value",
+        ))
+    };
+
     match raw {
-        // Mirror the codegen-emitted `Deserialize` impl's `visit_unit`:
-        // a bare `null` (e.g. an array element) decodes to the default
-        // (zero-numbered) variant, not to "unknown".
-        Value::Null => Ok(E::default()),
-        Value::String(s) => {
-            E::from_proto_name(s).ok_or_else(|| serde_json::Error::unknown_variant(s, &[]))
+        Value::Null => Err(malformed(Unexpected::Unit)),
+        Value::String(s) => E::from_proto_name(s).ok_or_else(|| {
+            ClosedEnumError::Unknown(serde_json::Error::invalid_value(
+                Unexpected::Str(s),
+                &"a known enum variant name",
+            ))
+        }),
+        Value::Number(n) if n.is_f64() => {
+            Err(malformed(Unexpected::Float(n.as_f64().unwrap_or(f64::NAN))))
         }
-        Value::Number(n) if n.is_f64() => Err(serde_json::Error::custom(alloc::format!(
-            "expected integer or string for enum value, got float {n}"
-        ))),
         Value::Number(n) => {
             // `as_i64()` / `as_u64()` are exclusive (a `Number` is stored
             // as exactly one of i64 / u64 / f64; the float case is handled
@@ -713,71 +717,73 @@ fn decode_closed_enum_strict<E: crate::Enumeration + Default>(
                 .and_then(|v| i32::try_from(v).ok())
                 .or_else(|| n.as_u64().and_then(|v| i32::try_from(v).ok()))
                 .ok_or_else(|| {
-                    serde_json::Error::custom(alloc::format!("enum value {n} out of i32 range"))
+                    ClosedEnumError::Malformed(serde_json::Error::custom(alloc::format!(
+                        "enum value {n} out of i32 range"
+                    )))
                 })?;
             E::from_i32(v32).ok_or_else(|| {
-                serde_json::Error::custom(alloc::format!("unknown enum value {v32}"))
+                ClosedEnumError::Unknown(serde_json::Error::custom(alloc::format!(
+                    "unknown enum value {v32}"
+                )))
             })
         }
-        other => Err(serde_json::Error::custom(alloc::format!(
-            "expected a protobuf enum name string, integer value, or null, got {other}"
-        ))),
+        Value::Bool(b) => Err(malformed(Unexpected::Bool(*b))),
+        Value::Array(_) => Err(malformed(Unexpected::Seq)),
+        Value::Object(_) => Err(malformed(Unexpected::Map)),
     }
 }
 
 /// Try to deserialize a `serde_json::Value` as `T` under strict enum parsing.
 ///
-/// When `ignore_unknown_enum_values` is active, returns `Ok(None)` for
-/// unknown values instead of propagating the error. This supports the
-/// repeated-enum and map-enum filtering behaviour (skip unknown entries).
+/// When `ignore_unknown_enum_values` is active, returns `Ok(None)` for an
+/// unknown enum name, so the caller can drop the entry from its container
+/// (or leave the optional unset). A string is the one JSON type whose decode
+/// can fail on an unknown value: an `EnumValue` keeps an unknown number, so
+/// every other failure is a wrong JSON type or a number outside `i32`, and
+/// stays an error.
 ///
-/// **`std` only**: filtering requires temporarily forcing strict mode to get
-/// a distinguishable error for unknown values, which needs the scoped
-/// thread-local. In `no_std` builds with global lenient enabled, singular
-/// enum fields still get accept-with-default behaviour (via the unconditional
-/// check in `open_enum_value::deserialize`), but repeated/map filtering
-/// (removing unknown entries from the container) is unavailable — errors
-/// propagate as in strict mode. Closed-enum containers are unaffected: they
-/// use [`try_deserialize_closed_enum`], which doesn't have this limitation.
+/// In `std` builds, filtering temporarily forces strict mode so an unknown
+/// enum name remains distinguishable from the default value. In `no_std`
+/// builds, `EnumValue` deserialization is already strict, so the process-wide
+/// option can filter the resulting error directly. Closed-enum containers use
+/// [`try_deserialize_closed_enum`] and follow the same lenient behavior.
 #[inline]
 fn try_deserialize_enum<T: serde::de::DeserializeOwned>(
     raw: serde_json::Value,
 ) -> Result<Option<T>, serde_json::Error> {
+    // Only a name can fail as unknown; see the doc comment.
+    let raw_is_string = raw.is_string();
+    let ignore = crate::json::ignore_unknown_enum_values();
+    // Run the inner deserialize in STRICT mode so that an unknown enum name
+    // is an error and not the default value.
     #[cfg(feature = "std")]
-    {
-        let ignore = crate::json::ignore_unknown_enum_values();
+    let result = {
         let strict = crate::json::JsonParseOptions {
             ignore_unknown_enum_values: false,
             ..Default::default()
         };
-        // Run the inner deserialize in STRICT mode so unknown enum values
-        // produce a distinguishable error, then swallow that error if the
-        // outer context wants lenient filtering.
-        let result =
-            crate::json::with_json_parse_options(&strict, || serde_json::from_value::<T>(raw));
-        match result {
-            Ok(v) => Ok(Some(v)),
-            Err(_) if ignore => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
+        crate::json::with_json_parse_options(&strict, || serde_json::from_value::<T>(raw))
+    };
+    // The inner `EnumValue` deserialize is always strict here; see the doc
+    // comment above.
     #[cfg(not(feature = "std"))]
-    {
-        // no_std: no scoped override available. Errors propagate as-is.
-        // (Global lenient mode only affects singular enum accept-with-default,
-        //  not container filtering.)
-        serde_json::from_value::<T>(raw).map(Some)
+    let result = serde_json::from_value::<T>(raw);
+    match result {
+        Ok(v) => Ok(Some(v)),
+        Err(_) if ignore && raw_is_string => Ok(None),
+        Err(e) => Err(e),
     }
 }
 
 // ── repeated_enum: Vec<EnumValue<E>> with unknown-value filtering ────────────
 
-/// Serde with-module for `Vec<EnumValue<E>>` repeated enum fields.
+/// Serde with-module for `Vec<EnumValue<E>>` repeated enum fields, or any
+/// collection that is `From<Vec<EnumValue<E>>>`.
 ///
-/// When `ignore_unknown_enum_values` is active (std only), unknown enum
-/// string values are silently skipped instead of producing an error.  In
-/// default mode (or no_std builds) this behaves identically to the standard
-/// `Vec<EnumValue<E>>` deserialization with null→empty-vec handling.
+/// When `ignore_unknown_enum_values` is active, unknown enum string values
+/// are silently skipped instead of producing an error. In default mode this
+/// behaves identically to the standard `Vec<EnumValue<E>>` deserialization
+/// with null→empty-vec handling.
 pub mod repeated_enum {
     use alloc::vec::Vec;
     use serde::{Deserializer, Serializer};
@@ -789,9 +795,12 @@ pub mod repeated_enum {
         serde::Serialize::serialize(value, s)
     }
 
-    pub fn deserialize<'de, E: crate::Enumeration, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Vec<crate::EnumValue<E>>, D::Error> {
+    pub fn deserialize<'de, E, C, D>(d: D) -> Result<C, D::Error>
+    where
+        E: crate::Enumeration,
+        C: From<Vec<crate::EnumValue<E>>>,
+        D: Deserializer<'de>,
+    {
         struct V<E>(core::marker::PhantomData<E>);
         impl<'de, E: crate::Enumeration> serde::de::Visitor<'de> for V<E> {
             type Value = Vec<crate::EnumValue<E>>;
@@ -819,7 +828,8 @@ pub mod repeated_enum {
                 Ok(out)
             }
         }
-        d.deserialize_any(V(core::marker::PhantomData))
+        d.deserialize_any(V::<E>(core::marker::PhantomData))
+            .map(C::from)
     }
 }
 
@@ -828,10 +838,12 @@ pub mod repeated_enum {
 /// Serde with-module for `HashMap<K, EnumValue<E>>` map fields where the
 /// value is an enum type.
 ///
-/// When `ignore_unknown_enum_values` is active (std only), map entries whose
-/// value is an unknown enum string are silently dropped.  In default mode
-/// (or no_std builds) this behaves identically to standard deserialization
-/// with null→empty-map handling.
+/// When `ignore_unknown_enum_values` is active, map entries whose value is
+/// an unknown enum string are silently dropped. In default mode this behaves
+/// identically to standard deserialization with null→empty-map handling.
+///
+/// The lenient rule assumes that the map's value type is `EnumValue<E>`: it
+/// drops an entry whose value is a string that fails to decode.
 pub mod map_enum {
     use crate::map_codec::MapStorage;
     use serde::{Deserializer, Serializer};
@@ -973,9 +985,15 @@ fn parse_exact_decimal_int(v: &str) -> Option<i128> {
     if int_part.is_empty() && frac_part.is_empty() {
         return None;
     }
-    // Trailing fractional zeros do not affect integrality and would only
-    // inflate the significand before we re-scale it.
+    // Trailing zeros do not affect integrality and would only inflate the
+    // significand before we re-scale it. Integer zeros move into the exponent.
     let frac_part = frac_part.trim_end_matches('0');
+    let (int_part, trailing_zeros) = if frac_part.is_empty() {
+        let trimmed = int_part.trim_end_matches('0');
+        (trimmed, int_part.len() - trimmed.len())
+    } else {
+        (int_part, 0)
+    };
 
     let mut significand = 0i128;
     for digit in int_part.bytes().chain(frac_part.bytes()) {
@@ -992,8 +1010,10 @@ fn parse_exact_decimal_int(v: &str) -> Option<i128> {
         return Some(0);
     }
 
-    // value = significand × 10^(exp − frac_len)
-    let scale = exp.checked_sub(frac_part.len() as i64)?;
+    // value = significand × 10^(exp + trailing_zeros − frac_len)
+    let scale = exp
+        .checked_add(trailing_zeros as i64)?
+        .checked_sub(frac_part.len() as i64)?;
     if scale >= 0 {
         let pow10 = 10i128.checked_pow(u32::try_from(scale).ok()?)?;
         significand = significand.checked_mul(pow10)?;
@@ -1201,6 +1221,23 @@ int_serde_module!(
 /// deserialization. A number or quoted decimal outside the `f32` range is an
 /// error, not infinity, and `"inf"` / `"nan"` in other spellings are rejected.
 ///
+/// A quoted decimal is parsed straight to `f32`, so it is rounded once, and
+/// so is an unquoted integer in the `i64` or `u64` range. Any other unquoted
+/// number reaches the visitor as the `f64` the deserializer parsed and is then
+/// narrowed to `f32`, so it is rounded twice. The results differ, by one `f32`
+/// ulp, when a decimal close to the midpoint between two adjacent `f32` values
+/// becomes that midpoint as an `f64`, which then rounds to even:
+/// `1.0000000596046448` decodes to `1.0` unquoted and to its nearest `f32`,
+/// `1.0000001`, quoted. How close is close enough depends on the `f64` parse
+/// (half an `f64` ulp with `serde_json`'s `float_roundtrip` feature, somewhat
+/// more without it). Just below the `f32` overflow threshold, the same effect
+/// makes an unquoted value an error that parses when quoted.
+///
+/// protobuf C++ also narrows a parsed `double`; protobuf-go rounds once. The
+/// `f64` does not identify the decimal it came from, so the decoding side
+/// cannot avoid this. A producer that wants single rounding can quote the
+/// value. Tracked in [#647](https://github.com/anthropics/buffa/issues/647).
+///
 /// Use with `#[serde(with = "::buffa::json_helpers::float")]`.
 pub mod float {
     use serde::{Deserializer, Serializer};
@@ -1257,7 +1294,9 @@ pub mod float {
             }
 
             fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<f32, E> {
-                // Reject finite values that overflow f32 range.
+                // The range check is on the narrowed `f32`: a decimal just
+                // above `f32::MAX` that rounds back into range parses, as the
+                // canonical text of `f32::MAX` (`3.4028235e+38`) does.
                 let f = v as f32;
                 if v.is_finite() && !f.is_finite() {
                     return Err(E::invalid_value(
@@ -1773,9 +1812,9 @@ pub mod opt_bytes {
 
 /// Serde with-module for `Option<EnumValue<E>>` optional enum fields (proto2).
 ///
-/// When `ignore_unknown_enum_values` is active (std only), unknown enum
-/// string values produce `None` (field not set) instead of `Some(default)`.
-/// In default mode (or no_std builds) unknown strings produce an error.
+/// When `ignore_unknown_enum_values` is active, unknown enum string values
+/// produce `None` (field not set) instead of `Some(default)`. In default
+/// mode unknown strings produce an error.
 pub mod opt_enum {
     use serde::{Deserializer, Serializer};
 
@@ -1910,11 +1949,11 @@ impl<E: crate::Enumeration> serde::Serialize for EnumProtoNameRef<'_, E> {
 
 // ── skip_if ───────────────────────────────────────────────────────────────────
 
-/// Predicates for `#[serde(skip_serializing_if = "...")]` on proto3 fields.
+/// Predicates for `#[serde(skip_serializing_if = "...")]` on implicit-presence
+/// fields.
 ///
-/// In proto3 JSON, fields whose value equals the type default are omitted.
-/// Attach these to the appropriate field types in generated `#[derive(Serialize)]`
-/// structs to match that behaviour.
+/// Proto3 JSON omits such a field at its protobuf default. Generated
+/// `Serialize` impls attach these to the matching field types.
 pub mod skip_if {
     pub fn is_zero_i32(v: &i32) -> bool {
         *v == 0
@@ -1931,15 +1970,16 @@ pub mod skip_if {
     pub fn is_false(v: &bool) -> bool {
         !*v
     }
-    /// Treats `-0.0` as zero (IEEE 754: `-0.0 == 0.0`), so negative zero
-    /// is omitted from JSON output. Correct for proto3 JSON but a
-    /// round-trip through JSON will not preserve `-0.0`.
+    /// Returns `true` only for `+0.0` (all bits clear). Returns `false` for
+    /// `-0.0` and NaN, so both are serialized. Differs from `*v == 0.0`, which
+    /// is also `true` for `-0.0`.
     pub fn is_zero_f32(v: &f32) -> bool {
-        *v == 0.0
+        v.to_bits() == 0
     }
-    /// See [`is_zero_f32`] — same `-0.0` behavior applies.
+    /// Returns `true` only for `+0.0` (all bits clear), and `false` for `-0.0`
+    /// and NaN.
     pub fn is_zero_f64(v: &f64) -> bool {
-        *v == 0.0
+        v.to_bits() == 0
     }
     pub fn is_empty_str(v: &str) -> bool {
         v.is_empty()
@@ -2026,7 +2066,10 @@ pub mod closed_enum {
                         if crate::json::ignore_unknown_enum_values() {
                             return Ok(E::default());
                         }
-                        Err(serde::de::Error::unknown_variant(v, &[]))
+                        Err(serde::de::Error::invalid_value(
+                            serde::de::Unexpected::Str(v),
+                            &"a known enum variant name",
+                        ))
                     }
                 }
             }
@@ -2039,8 +2082,9 @@ pub mod closed_enum {
 
 /// Serde with-module for `Option<E>` optional closed enum fields (proto2).
 ///
-/// When `ignore_unknown_enum_values` is active, unknown enum
-/// string values produce `None` (field not set) instead of an error.
+/// When `ignore_unknown_enum_values` is active, an unknown enum name, or a
+/// number in `i32` range that the enum does not declare, produces `None`
+/// (field not set) instead of an error.
 pub mod opt_closed_enum {
     use serde::{Deserializer, Serializer};
 
@@ -2069,10 +2113,13 @@ pub mod opt_closed_enum {
 
 // ── repeated_closed_enum: Vec<E> with unknown-value filtering ────────────────
 
-/// Serde with-module for `Vec<E>` repeated closed enum fields.
+/// Serde with-module for `Vec<E>` repeated closed enum fields, or any
+/// collection that is `From<Vec<E>>`.
 ///
-/// When `ignore_unknown_enum_values` is active, unknown enum
-/// string values are silently skipped.
+/// When `ignore_unknown_enum_values` is active, an unknown enum name, or a
+/// number in `i32` range that the enum does not declare, is silently
+/// skipped.
+/// JSON null deserializes to an empty vec, but null elements are rejected.
 pub mod repeated_closed_enum {
     use alloc::vec::Vec;
     use serde::{Deserializer, Serializer};
@@ -2089,9 +2136,12 @@ pub mod repeated_closed_enum {
         seq.end()
     }
 
-    pub fn deserialize<'de, E: crate::Enumeration + Default, D: Deserializer<'de>>(
-        d: D,
-    ) -> Result<Vec<E>, D::Error> {
+    pub fn deserialize<'de, E, C, D>(d: D) -> Result<C, D::Error>
+    where
+        E: crate::Enumeration + Default,
+        C: From<Vec<E>>,
+        D: Deserializer<'de>,
+    {
         struct V<E>(core::marker::PhantomData<E>);
         impl<'de, E: crate::Enumeration + Default> serde::de::Visitor<'de> for V<E> {
             type Value = Vec<E>;
@@ -2119,7 +2169,8 @@ pub mod repeated_closed_enum {
                 Ok(out)
             }
         }
-        d.deserialize_any(V(core::marker::PhantomData))
+        d.deserialize_any(V::<E>(core::marker::PhantomData))
+            .map(C::from)
     }
 }
 
@@ -2128,8 +2179,10 @@ pub mod repeated_closed_enum {
 /// Serde with-module for `HashMap<K, E>` map fields where the value is a
 /// closed enum type.
 ///
-/// When `ignore_unknown_enum_values` is active, map entries whose
-/// value is an unknown enum string are silently dropped.
+/// When `ignore_unknown_enum_values` is active, map entries whose value is
+/// an unknown enum name, or a number in `i32` range that the enum does not
+/// declare, are silently dropped.
+/// JSON null deserializes to an empty map, but null values are rejected.
 pub mod map_closed_enum {
     use crate::map_codec::MapStorage;
     use serde::{Deserializer, Serializer};

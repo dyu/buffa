@@ -27,6 +27,9 @@ use hashbrown::HashMap;
 /// [`TextAnyEntry`]: crate::type_registry::TextAnyEntry
 pub struct JsonAnyEntry {
     /// The full type URL (e.g. `"type.googleapis.com/google.protobuf.Duration"`).
+    ///
+    /// The message full name is the text after the last `/`, or the whole
+    /// string when it has no `/`.
     pub type_url: &'static str,
 
     /// Serialize: binary `Any.value` bytes → JSON representation of the
@@ -63,6 +66,8 @@ pub type AnyTypeEntry = JsonAnyEntry;
 /// deserialize messages containing `Any` fields.
 pub struct AnyRegistry {
     entries: HashMap<String, JsonAnyEntry>,
+    /// Message full name → the type URL most recently registered for it.
+    by_type_name: HashMap<&'static str, &'static str>,
 }
 
 impl AnyRegistry {
@@ -70,18 +75,57 @@ impl AnyRegistry {
     pub fn new() -> Self {
         Self {
             entries: HashMap::new(),
+            by_type_name: HashMap::new(),
         }
     }
 
-    /// Registers a type entry. Replaces any existing entry for the same type URL.
+    /// Registers a type entry.
+    ///
+    /// Replaces any existing entry for the same type URL. When the same
+    /// message full name is registered under several URLs, a
+    /// [`lookup`](Self::lookup) of a URL that is not itself registered uses
+    /// the most recently registered one.
+    ///
+    /// A lookup by name decodes the payload as this message. A payload under
+    /// another prefix that does not decode as it fails to serialize as JSON;
+    /// one that does decode is written with this message's fields.
     pub fn register(&mut self, entry: JsonAnyEntry) {
+        let type_name = message_name(entry.type_url);
+        if !type_name.is_empty() {
+            self.by_type_name.insert(type_name, entry.type_url);
+        }
         self.entries.insert(entry.type_url.to_owned(), entry);
     }
 
-    /// Looks up a type entry by its full type URL.
+    /// Looks up a type entry by type URL.
+    ///
+    /// A registered URL finds its own entry. Any other URL is matched by the
+    /// message full name after its last `/`, because `google.protobuf.Any`
+    /// identifies the message by that name and leaves the prefix to the
+    /// application. `custom.example/v1/pkg.Message` therefore finds a type
+    /// registered as `type.googleapis.com/pkg.Message`. A string without a
+    /// `/` is matched as a bare full name, so `pkg.Message` finds that type
+    /// too.
+    ///
+    /// The entry's `type_url` is the registered one. Keep the URL you looked
+    /// up as the `Any`'s `type_url`.
     pub fn lookup(&self, type_url: &str) -> Option<&JsonAnyEntry> {
-        self.entries.get(type_url)
+        if let Some(entry) = self.entries.get(type_url) {
+            return Some(entry);
+        }
+
+        let registered_url = *self.by_type_name.get(message_name(type_url))?;
+        self.entries.get(registered_url)
     }
+}
+
+/// Returns the message full name in a type URL: the text after its last `/`,
+/// or the whole string when it has no `/`. Empty when the URL names no
+/// message.
+fn message_name(type_url: &str) -> &str {
+    type_url
+        .rsplit_once('/')
+        .map_or(type_url, |(_, type_name)| type_name)
 }
 
 impl core::fmt::Debug for AnyRegistry {
@@ -177,7 +221,40 @@ mod tests {
         assert!(registry
             .lookup("type.googleapis.com/test.Message")
             .is_some());
+        assert!(registry.lookup("custom.example/v1/test.Message").is_some());
         assert!(registry.lookup("type.googleapis.com/test.Other").is_none());
+    }
+
+    #[test]
+    fn lookup_falls_back_to_the_last_url_registered_for_a_name() {
+        let mut registry = AnyRegistry::new();
+        registry.register(entry!("first.example/test.Message", false));
+        registry.register(entry!("second.example/test.Message", true));
+
+        // A registered URL finds its own entry.
+        let first = registry.lookup("first.example/test.Message").unwrap();
+        assert_eq!(first.type_url, "first.example/test.Message");
+        let second = registry.lookup("second.example/test.Message").unwrap();
+        assert_eq!(second.type_url, "second.example/test.Message");
+
+        // Any other prefix finds the last entry registered for the name.
+        let other = registry.lookup("other.example/v1/test.Message").unwrap();
+        assert_eq!(other.type_url, "second.example/test.Message");
+
+        // A string with no `/` is a bare full name.
+        let bare = registry.lookup("test.Message").unwrap();
+        assert_eq!(bare.type_url, "second.example/test.Message");
+
+        // An entry registered under a bare name is found under a prefix too.
+        registry.register(entry!("test.Bare", false));
+        let prefixed = registry.lookup("other.example/test.Bare").unwrap();
+        assert_eq!(prefixed.type_url, "test.Bare");
+
+        // A name no entry was registered for, an empty string, and a URL with
+        // nothing after its last `/` find no entry.
+        assert!(registry.lookup("test.Other").is_none());
+        assert!(registry.lookup("").is_none());
+        assert!(registry.lookup("other.example/").is_none());
     }
 
     #[test]
@@ -193,12 +270,9 @@ mod tests {
         assert!(!regular.is_wkt);
     }
 
-    /// Serializes tests that manipulate the global `ANY_REGISTRY`.
-    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     #[test]
     fn global_registry() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_doubles::REGISTRY_TEST_LOCK.lock().unwrap();
         let mut registry = AnyRegistry::new();
         registry.register(entry!("type.googleapis.com/test.Global", false));
         set_any_registry(Box::new(registry));
@@ -217,7 +291,7 @@ mod tests {
 
     #[test]
     fn set_registry_twice_supersedes_first() {
-        let _guard = REGISTRY_TEST_LOCK.lock().unwrap();
+        let _guard = crate::test_doubles::REGISTRY_TEST_LOCK.lock().unwrap();
         let mut first = AnyRegistry::new();
         first.register(entry!("type.googleapis.com/test.First", false));
         set_any_registry(Box::new(first));

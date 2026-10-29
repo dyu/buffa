@@ -21,7 +21,7 @@ use buffa_codegen::generated::compiler::code_generator_response::File as CodeGen
 use buffa_codegen::generated::compiler::CodeGeneratorResponse;
 use buffa_codegen::generated::descriptor::Edition;
 
-use buffa_codegen::{CodeGenConfig, EnumTypeOverride, FeatureOverride};
+use buffa_codegen::{CodeGenConfig, CodecStrategy, EnumTypeOverride, FeatureOverride};
 
 const HELP: &str = "\
 protoc-gen-buffa — protoc plugin for generating Rust code with buffa.
@@ -46,6 +46,9 @@ protoc-gen-buffa-packaging.
 
 Options are passed as a comma-separated parameter string, e.g.
   --buffa_opt=views=true,json=true,extern_path=.my.pkg=::my_crate
+The proto side of extern_path is a dotted protobuf package or type name
+(leading dot optional); a name with an empty or non-identifier segment
+is an error.
 
 To skip a package pulled in by include_imports (e.g. an option-only
 import that is never referenced as a field), use exclude_package:
@@ -177,7 +180,9 @@ struct PluginConfig {
 ///   --buffa_opt=views=true,unknown_fields=false,json=true
 ///
 /// Extern paths use the format `extern_path=<proto>=<rust>`, where `<proto>`
-/// is either a package or a single type FQN:
+/// is either a package or a single type FQN (a dotted protobuf name; the
+/// leading dot is optional and one trailing dot is ignored), or `.` for
+/// every type:
 ///   --buffa_opt=extern_path=.my.common=::common_protos
 ///   --buffa_opt=extern_path=.my.common.Shared=::shared_types::Shared
 fn parse_config(params: &str) -> Result<PluginConfig, String> {
@@ -225,6 +230,23 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
                     true,
                 ));
             }
+            // Repeatable. Omits the generated `Debug` for matching messages
+            // and for enums named exactly, so the crate can write its own.
+            // Same path grammar as `unknown_fields_in`. The option takes a
+            // path where its unsuffixed siblings take a boolean, so a boolean
+            // is rejected instead of becoming the rule `.true`.
+            "skip_debug" => {
+                let path = value.trim();
+                if matches!(path, "true" | "false") {
+                    return Err(format!(
+                        "skip_debug takes a proto path, not '{path}'; \
+                         use 'skip_debug=.' to match every message"
+                    ));
+                }
+                codegen
+                    .skip_debug
+                    .push(normalize_proto_path(path, "skip_debug")?);
+            }
             "text" => codegen.generate_text = parse_bool("text", value)?,
             "arbitrary" => codegen.generate_arbitrary = parse_bool("arbitrary", value)?,
             // `gate_impls=true` wraps generated impls in `#[cfg(feature = ...)]`
@@ -267,6 +289,11 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
             // methods. Like `register_types`, the default is on, so the
             // accepted spelling is the negation.
             "with_setters" => codegen.generate_with_setters = parse_bool("with_setters", value)?,
+            // `map_entries_omit_defaults=true` writes maps as prost does,
+            // leaving default entry fields out.
+            "map_entries_omit_defaults" => {
+                codegen.map_entries_omit_defaults = parse_bool("map_entries_omit_defaults", value)?
+            }
             // `reflection=true` selects the fast vtable mode (same as
             // `reflect_mode=vtable`); `reflect_mode=bridge` opts into the
             // smaller round-trip implementation.
@@ -330,6 +357,25 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
                     .unboxed_oneof_fields
                     .push(normalize_unbox_oneof_path(value.trim())?);
             }
+            // `codec_strategy=table` generates the binary `Message` impl of
+            // each message the table can handle from a static table and shared
+            // interpreters (default `unrolled`). Path-scoped rules use the repeatable
+            // `codec_strategy_in=<path>=<strategy>`, whatever the option
+            // order; the last matching rule wins.
+            "codec_strategy" => codegen.codec_strategy = parse_codec_strategy(value)?,
+            "codec_strategy_in" => {
+                let (path, strategy) = value.rsplit_once('=').ok_or_else(|| {
+                    format!(
+                        "invalid codec_strategy_in format '{value}', expected \
+                         'codec_strategy_in=<proto_path>=<strategy>' \
+                         (e.g. 'codec_strategy_in=.my.pkg.Msg=unrolled')"
+                    )
+                })?;
+                codegen.codec_strategy_in.push((
+                    normalize_proto_path(path.trim(), "codec_strategy_in")?,
+                    parse_codec_strategy(strategy)?,
+                ));
+            }
             // `type_name_prefix=Rpc` prepends a prefix to every generated
             // message/enum type name (and their view types). The value is
             // passed through verbatim; buffa-codegen rejects anything that
@@ -383,11 +429,7 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
                                  (or a type FQN, 'extern_path=.proto.pkg.Type=::rust::path::Type')"
                         ));
                     }
-                    let mut proto = proto.to_string();
-                    // Normalize: accept both ".my.pkg" and "my.pkg".
-                    if !proto.starts_with('.') {
-                        proto.insert(0, '.');
-                    }
+                    let proto = buffa_codegen::normalize_extern_path_proto_name(proto)?;
                     codegen.extern_paths.push((proto, rust.to_string()));
                 } else {
                     return Err(format!(
@@ -481,6 +523,16 @@ fn parse_config(params: &str) -> Result<PluginConfig, String> {
     }
 
     Ok(PluginConfig { codegen })
+}
+
+fn parse_codec_strategy(value: &str) -> Result<CodecStrategy, String> {
+    match value.trim() {
+        "unrolled" => Ok(CodecStrategy::Unrolled),
+        "table" => Ok(CodecStrategy::Table),
+        other => Err(format!(
+            "invalid codec strategy '{other}', expected 'unrolled' or 'table'"
+        )),
+    }
 }
 
 fn parse_bool(key: &str, value: &str) -> Result<bool, String> {
@@ -641,6 +693,15 @@ mod tests {
     }
 
     #[test]
+    fn skip_debug_is_repeatable_and_normalized() {
+        let config = parse_config("skip_debug=demo.Uuid4,skip_debug=.demo.Level.").unwrap();
+        assert_eq!(config.codegen.skip_debug, [".demo.Uuid4", ".demo.Level"]);
+        assert!(parse_config("skip_debug=").is_err());
+        let err = parse_err("skip_debug=true");
+        assert!(err.contains("takes a proto path"), "{err}");
+    }
+
+    #[test]
     fn unknown_fields_in_is_repeatable_and_normalized() {
         let config = parse_config(
             "unknown_fields_in=wa.Keep,unknown_fields=false,unknown_fields_in=.wa.Also.,unknown_fields_in= . ",
@@ -704,6 +765,13 @@ mod tests {
     fn idiomatic_field_names_defaults_off() {
         let config = parse_config("").unwrap();
         assert!(!config.codegen.idiomatic_field_names);
+    }
+
+    #[test]
+    fn map_entries_omit_defaults_is_off_unless_asked() {
+        assert!(!parse_config("").unwrap().codegen.map_entries_omit_defaults);
+        let config = parse_config("map_entries_omit_defaults=true").unwrap();
+        assert!(config.codegen.map_entries_omit_defaults);
     }
 
     #[test]
@@ -771,6 +839,42 @@ mod tests {
     }
 
     #[test]
+    fn codec_strategy_sets_the_global_default_and_rules_are_repeatable() {
+        let config = parse_config(
+            "codec_strategy=table,codec_strategy_in=my.pkg.Msg=unrolled,\
+             codec_strategy_in= .my.pkg.Other. =table",
+        )
+        .unwrap();
+        assert_eq!(config.codegen.codec_strategy, CodecStrategy::Table);
+        assert_eq!(
+            config.codegen.codec_strategy_in,
+            vec![
+                (".my.pkg.Msg".to_string(), CodecStrategy::Unrolled),
+                (".my.pkg.Other".to_string(), CodecStrategy::Table),
+            ]
+        );
+        assert_eq!(
+            parse_config("").unwrap().codegen.codec_strategy,
+            CodecStrategy::Unrolled
+        );
+    }
+
+    #[test]
+    fn codec_strategy_rejects_unknown_strategies_and_malformed_rules() {
+        let err = parse_err("codec_strategy=fast");
+        assert!(err.contains("invalid codec strategy 'fast'"), "{err}");
+        let err = parse_err("codec_strategy_in=.my.pkg.Msg");
+        assert!(
+            err.contains("codec_strategy_in=<proto_path>=<strategy>"),
+            "{err}"
+        );
+        let err = parse_err("codec_strategy_in=.my.pkg.Msg=");
+        assert!(err.contains("invalid codec strategy ''"), "{err}");
+        let err = parse_err("codec_strategy_in==table");
+        assert!(err.contains("non-empty proto path"), "{err}");
+    }
+
+    #[test]
     fn unbox_oneof_rejects_non_boolean_values() {
         // A path or a near-miss boolean is an error, never a silent no-op.
         for params in [
@@ -801,6 +905,64 @@ mod tests {
     fn extern_path_without_leading_dot_is_normalized() {
         let config = parse_config("extern_path=my.common=::common_protos").unwrap();
         assert_eq!(config.codegen.extern_paths[0].0, ".my.common");
+    }
+
+    #[test]
+    fn extern_path_trailing_dot_is_normalized() {
+        let config = parse_config("extern_path=.my.common.=::common_protos").unwrap();
+        assert_eq!(config.codegen.extern_paths[0].0, ".my.common");
+    }
+
+    #[test]
+    fn extern_path_rejects_empty_proto_segments() {
+        for proto in [
+            "..",
+            "..my",
+            ".my..common",
+            "my..common",
+            ".my.common..Shared",
+            ".my.common..",
+            "my.common...",
+        ] {
+            assert!(
+                parse_config(&format!("extern_path={proto}=::common_protos")).is_err(),
+                "{proto}"
+            );
+        }
+    }
+
+    #[test]
+    fn extern_path_rejects_invalid_proto_identifiers() {
+        for proto in [".my.123", ".my.1st", ".my.common-name", ".my.com mon"] {
+            assert!(
+                parse_config(&format!("extern_path={proto}=::common_protos")).is_err(),
+                "{proto}"
+            );
+        }
+    }
+
+    #[test]
+    fn extern_path_accepts_leading_underscore_segments() {
+        // `package _internal;` and `message _Foo` are valid protobuf names.
+        for (proto, normalized) in [
+            ("._internal", "._internal"),
+            ("my._common", ".my._common"),
+            (".my._Foo", ".my._Foo"),
+            ("._", "._"),
+        ] {
+            let config = parse_config(&format!("extern_path={proto}=::common_protos"))
+                .unwrap_or_else(|e| panic!("{proto}: {e}"));
+            assert_eq!(config.codegen.extern_paths[0].0, normalized);
+        }
+    }
+
+    #[test]
+    fn extern_path_accepts_catchall_and_valid_identifier_edges() {
+        let catchall = parse_config("extern_path=.=::all_protos").unwrap();
+        assert_eq!(catchall.codegen.extern_paths[0].0, ".");
+
+        let identifiers = parse_config("extern_path=my.v2.Type_1=::my_protos").unwrap();
+        assert_eq!(identifiers.codegen.extern_paths[0].0, ".my.v2.Type_1");
     }
 
     #[test]

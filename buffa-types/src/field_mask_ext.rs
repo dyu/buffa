@@ -1,6 +1,7 @@
 //! Ergonomic helpers for [`google::protobuf::FieldMask`](crate::google::protobuf::FieldMask).
 
 use alloc::string::String;
+use alloc::vec::Vec;
 
 use crate::google::protobuf::FieldMask;
 
@@ -24,10 +25,199 @@ impl FieldMask {
 
     /// Returns `true` if `path` is present in this field mask.
     ///
-    /// Comparison is exact (case-sensitive, no wildcard expansion).
+    /// Comparison is exact (case-sensitive, no wildcard expansion), so a mask
+    /// of `user` does not contain `user.name`. [`covers`](Self::covers) also
+    /// returns `true` when the mask holds an ancestor of `path`, and
+    /// [`overlaps`](Self::overlaps) when it holds an ancestor or a descendant.
     /// Runs in O(n) time where n is the number of paths.
     pub fn contains(&self, path: &str) -> bool {
         self.paths.iter().any(|p| p == path)
+    }
+
+    /// Returns `true` if this mask contains `path` or an ancestor of `path`.
+    ///
+    /// For example, `user` covers `user.name`, but does not cover `username`.
+    /// Comparison is case-sensitive and uses dots as component boundaries.
+    /// Runs in O(n) path comparisons where n is the number of mask paths.
+    ///
+    /// The mask is read as a plain list of paths:
+    ///
+    /// - Coverage runs from ancestor to descendant only. A mask that contains
+    ///   `settings.theme` does not cover `settings`. A handler that needs to
+    ///   know whether the mask selects `settings` or anything under it calls
+    ///   [`overlaps`](Self::overlaps).
+    /// - An empty mask does not cover any path, and an unset mask field reads
+    ///   as an empty mask. `google.protobuf.FieldMask` defines an absent
+    ///   update mask as every field. A handler that follows that rule must
+    ///   check [`is_empty`](Self::is_empty) before it calls `covers`.
+    /// - `*` is an ordinary path: a mask that contains `*` does not cover
+    ///   `user`. So is the empty path `""`: it covers `""` and `.user`, and
+    ///   does not cover `user`.
+    /// - Paths are compared byte for byte and are not validated against a
+    ///   message descriptor. A mask deserialized from JSON contains proto
+    ///   field names (`user.display_name`), not JSON names
+    ///   (`user.displayName`), so `path` must use proto field names.
+    ///   [`from_paths`](Self::from_paths) stores its input unchanged.
+    /// - Backtick quoting is not parsed. Where an API writes a map key that
+    ///   contains a dot as `` labels.`a.b` ``, the dot inside the backticks is
+    ///   a component boundary here: a mask that contains `` labels.`a ``
+    ///   covers that path.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use buffa_types::google::protobuf::FieldMask;
+    ///
+    /// let mask = FieldMask::from_paths(["user", "settings.theme"]);
+    /// assert!(mask.covers("user"));
+    /// assert!(mask.covers("user.name"));
+    /// assert!(!mask.covers("username"));
+    /// assert!(!mask.covers("settings"));
+    /// assert!(!FieldMask::default().covers("user"));
+    /// ```
+    pub fn covers(&self, path: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|ancestor| path_is_covered(path, ancestor))
+    }
+
+    /// Returns `true` if this mask contains `path`, an ancestor of `path`, or
+    /// a descendant of `path`.
+    ///
+    /// Where [`covers`](Self::covers) asks whether the mask selects `path`
+    /// whole, `overlaps` asks whether it selects `path` or anything under it.
+    /// A mask that contains `settings.theme` overlaps `settings` but does not
+    /// cover it: it selects only part of `settings`. Paths follow the rules
+    /// `covers` documents: dots are component boundaries, so `user` does not
+    /// overlap `username`, `*` is literal, and the empty path `""` is an
+    /// ordinary path, not a root that every path is under. Runs in O(n) path
+    /// comparisons where n is the number of mask paths.
+    ///
+    /// An empty mask overlaps nothing, and an unset mask field reads as an
+    /// empty mask. `google.protobuf.FieldMask` defines an absent update mask
+    /// as every field, so a handler that follows that rule must check
+    /// [`is_empty`](Self::is_empty) before it calls `overlaps`.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use buffa_types::google::protobuf::FieldMask;
+    ///
+    /// let mask = FieldMask::from_paths(["settings.theme"]);
+    /// assert!(!mask.covers("settings"));
+    /// assert!(mask.overlaps("settings"));
+    /// assert!(mask.overlaps("settings.theme.color"));
+    /// assert!(!mask.overlaps("settings.locale"));
+    ///
+    /// // Whether an update touches `settings` at all, treating an absent mask
+    /// // as every field:
+    /// let touches_settings = |mask: &FieldMask| mask.is_empty() || mask.overlaps("settings");
+    /// assert!(touches_settings(&mask));
+    /// assert!(touches_settings(&FieldMask::default()));
+    /// assert!(!touches_settings(&FieldMask::from_paths(["user"])));
+    /// ```
+    pub fn overlaps(&self, path: &str) -> bool {
+        self.paths
+            .iter()
+            .any(|p| path_is_covered(path, p) || path_is_covered(p, path))
+    }
+
+    /// Sorts the paths component by component, comparing each component as a
+    /// `str`, and removes duplicates and paths that an ancestor in the mask
+    /// already covers.
+    ///
+    /// The normalized mask [`covers`](Self::covers) exactly the paths it
+    /// covered before, and paths are compared as `covers` compares them. For
+    /// paths made of field names, the order is the same as sorting the paths
+    /// as strings. Runs in O(n log n) path comparisons and operates in place
+    /// without allocating new path strings.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use buffa_types::google::protobuf::FieldMask;
+    ///
+    /// let mut mask = FieldMask::from_paths(["user.name", "settings.theme", "user", "user"]);
+    /// mask.normalize();
+    /// assert_eq!(mask.paths, ["settings.theme", "user"]);
+    /// assert!(mask.covers("user.name"));
+    /// ```
+    pub fn normalize(&mut self) {
+        // Component ordering keeps every parent's descendants adjacent even
+        // when a caller supplies paths outside the usual proto identifier syntax.
+        self.paths
+            .sort_unstable_by(|a, b| a.split('.').cmp(b.split('.')));
+        self.paths
+            .dedup_by(|path, ancestor| path_is_covered(path, ancestor));
+    }
+
+    /// Returns a normalized mask covering every path covered by either mask.
+    ///
+    /// Uses the same path rules as [`covers`](Self::covers): an empty mask
+    /// covers nothing, `*` is literal, and paths are not validated against a
+    /// descriptor. Neither input is modified. The result contains only the
+    /// combined paths, without unknown protobuf fields from either input.
+    /// Runs in O((n + m) log(n + m)) path comparisons.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use buffa_types::FieldMask;
+    ///
+    /// let left = FieldMask::from_paths(["user.name", "settings.theme"]);
+    /// let right = FieldMask::from_paths(["user", "settings.locale"]);
+    /// assert_eq!(left.union(&right).paths, ["settings.locale", "settings.theme", "user"]);
+    /// ```
+    #[must_use]
+    pub fn union(&self, other: &Self) -> Self {
+        let mut mask = Self::from_paths(self.paths.iter().chain(&other.paths).cloned());
+        mask.normalize();
+        mask
+    }
+
+    /// Returns a normalized mask covering only paths covered by both masks.
+    ///
+    /// When one mask selects an ancestor of a path in the other, the result
+    /// selects the more specific path: `user` intersected with `user.name`
+    /// is `user.name`.
+    ///
+    /// Uses the same path rules as [`covers`](Self::covers): an empty mask
+    /// covers nothing, `*` is literal, and paths are not validated against a
+    /// descriptor. Neither input is modified. The result contains only the
+    /// shared paths, without unknown protobuf fields from either input.
+    /// Runs in O(n log n + m log m) path comparisons.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use buffa_types::FieldMask;
+    ///
+    /// let left = FieldMask::from_paths(["user", "settings.theme"]);
+    /// let right = FieldMask::from_paths(["user.name", "settings"]);
+    /// assert_eq!(left.intersection(&right).paths, ["settings.theme", "user.name"]);
+    /// ```
+    #[must_use]
+    pub fn intersection(&self, other: &Self) -> Self {
+        if self.is_empty() || other.is_empty() {
+            return Self::default();
+        }
+        let mut left = normalized_paths(&self.paths).into_iter().peekable();
+        let mut right = normalized_paths(&other.paths).into_iter().peekable();
+        let mut mask = Self::default();
+        while let (Some(&a), Some(&b)) = (left.peek(), right.peek()) {
+            if path_is_covered(a, b) {
+                mask.paths.push(a.into());
+                left.next();
+            } else if path_is_covered(b, a) {
+                mask.paths.push(b.into());
+                right.next();
+            } else if a.split('.').lt(b.split('.')) {
+                left.next();
+            } else {
+                right.next();
+            }
+        }
+        mask
     }
 
     /// Returns the number of paths in the field mask.
@@ -46,6 +236,45 @@ impl FieldMask {
     #[inline]
     pub fn iter(&self) -> core::slice::Iter<'_, String> {
         self.paths.iter()
+    }
+}
+
+/// Whether `ancestor` is `path` or one of its ancestors.
+fn path_is_covered(path: &str, ancestor: &str) -> bool {
+    path.strip_prefix(ancestor)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('.'))
+}
+
+fn normalized_paths(paths: &[String]) -> Vec<&str> {
+    let mut paths: Vec<_> = paths.iter().map(String::as_str).collect();
+    paths.sort_unstable_by(|a, b| a.split('.').cmp(b.split('.')));
+    paths.dedup_by(|path, ancestor| path_is_covered(path, ancestor));
+    paths
+}
+
+impl<T: Into<String>> FromIterator<T> for FieldMask {
+    /// Collect field paths into a [`FieldMask`], preserving their order and duplicates.
+    ///
+    /// Like [`FieldMask::from_paths`], this does not validate or normalize paths.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// use buffa_types::FieldMask;
+    ///
+    /// let mask: FieldMask = ["user.name", "user.email"].into_iter().collect();
+    /// assert_eq!(mask.paths, ["user.name", "user.email"]);
+    /// ```
+    fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
+        Self::from_paths(iter)
+    }
+}
+
+impl<T: Into<String>> Extend<T> for FieldMask {
+    /// Appends each path in iteration order, without validating or
+    /// normalizing, as [`FieldMask::from_paths`] does.
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        self.paths.extend(iter.into_iter().map(Into::into));
     }
 }
 
@@ -74,8 +303,6 @@ impl IntoIterator for FieldMask {
 // into the same code, so the two paths can't drift on edge cases the
 // conformance suite exercises.
 
-#[cfg(feature = "json")]
-use alloc::vec::Vec;
 #[cfg(feature = "json")]
 use buffa::json_helpers::wkt::{camel_to_snake, field_mask_path_round_trips, snake_to_camel};
 
@@ -149,6 +376,49 @@ impl<'de> serde::Deserialize<'de> for FieldMask {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use alloc::string::ToString;
+    use alloc::{vec, vec::Vec};
+
+    #[test]
+    fn collect_paths_preserves_input() {
+        let paths = ["user.name", "user", "user.name", "", "é.child", "*"];
+        let mask: FieldMask = paths.into_iter().collect();
+        assert_eq!(mask.paths, paths);
+        assert_eq!(mask, FieldMask::from_paths(paths));
+    }
+
+    #[test]
+    fn collect_owned_paths_moves_strings() {
+        let path = String::from("user.name");
+        let ptr = path.as_ptr();
+        let mask: FieldMask = core::iter::once(path).collect();
+        assert_eq!(mask.paths, ["user.name"]);
+        assert_eq!(mask.paths[0].as_ptr(), ptr);
+        assert!(mask.__buffa_unknown_fields.is_empty());
+    }
+
+    #[test]
+    fn collect_borrowed_strings() {
+        let paths = [String::from("user.name"), String::from("user.email")];
+        let mask: FieldMask = paths.iter().collect();
+        assert_eq!(mask.paths, paths);
+    }
+
+    #[test]
+    fn collect_empty_paths() {
+        let mask: FieldMask = core::iter::empty::<String>().collect();
+        assert_eq!(mask, FieldMask::default());
+        let mask: FieldMask = core::iter::empty::<&str>().collect();
+        assert_eq!(mask, FieldMask::default());
+    }
+
+    #[test]
+    fn extend_appends_without_normalizing() {
+        let mut mask = FieldMask::from_paths(["user"]);
+        mask.extend(["user.name", "user"]);
+        mask.extend(vec![String::from("settings")]);
+        assert_eq!(mask.paths, ["user", "user.name", "user", "settings"]);
+    }
 
     #[test]
     fn from_paths_empty() {
@@ -208,6 +478,243 @@ mod tests {
     fn contains_is_case_sensitive() {
         let mask = FieldMask::from_paths(["user.Name"]);
         assert!(!mask.contains("user.name"));
+    }
+
+    #[test]
+    fn covers_exact_paths_and_descendants_only() {
+        let mask = FieldMask::from_paths(["user", "settings.theme", "User.Name"]);
+        for path in [
+            "user",
+            "user.name",
+            "user.name.first",
+            "settings.theme.color",
+            "User.Name",
+        ] {
+            assert!(mask.covers(path), "{path}");
+        }
+        for path in [
+            "username",
+            "user_name",
+            "settings",
+            "settings.themes",
+            "User.name",
+            "",
+        ] {
+            assert!(!mask.covers(path), "{path}");
+        }
+        assert!(!FieldMask::default().covers("user"));
+        assert!(!FieldMask::from_paths(["*"]).covers("user"));
+    }
+
+    #[test]
+    fn overlaps_ancestors_descendants_and_equal_paths_only() {
+        let mask = FieldMask::from_paths(["user", "settings.theme", "User.Name"]);
+        for path in [
+            "user",
+            "user.name",
+            "settings",
+            "settings.theme",
+            "settings.theme.color",
+            "User",
+            "User.Name.First",
+        ] {
+            assert!(mask.overlaps(path), "{path}");
+        }
+        for path in [
+            "username",
+            "use",
+            "settings.locale",
+            "settings.themes",
+            "setting",
+            "User.name",
+            "",
+        ] {
+            assert!(!mask.overlaps(path), "{path}");
+        }
+        assert!(!FieldMask::default().overlaps("user"));
+        assert!(!FieldMask::from_paths(["*"]).overlaps("user"));
+        assert!(!FieldMask::from_paths(["user"]).overlaps("*"));
+        assert!(FieldMask::from_paths(["*"]).overlaps("*"));
+    }
+
+    #[test]
+    fn overlaps_matches_intersecting_with_a_one_path_mask() {
+        // `intersection` sorts, deduplicates and merges independently, so it
+        // checks `overlaps` against a second algorithm. The mask is unsorted,
+        // has a duplicate and an ancestor/descendant pair, and empty
+        // components, so the normalization inside `intersection` runs too.
+        let mask = FieldMask::from_paths(["g.", "d.e.f", "c", "a.b", "a", "c", "", ".x"]);
+        for path in [
+            "a", "a.b", "a.b.c", "a.bc", "ab", "c", "c.d", "d", "d.e", "d.f", "g", "g.", "x", "",
+            ".x", ".y", ".x.z",
+        ] {
+            let single = FieldMask::from_paths([path]);
+            assert_eq!(
+                mask.overlaps(path),
+                !mask.intersection(&single).is_empty(),
+                "{path}"
+            );
+        }
+    }
+
+    #[test]
+    fn overlaps_treats_every_dot_as_a_component_boundary() {
+        // Same path rules as `covers`, applied in both directions.
+        let labels = FieldMask::from_paths(["labels.`a.b`"]);
+        assert!(labels.overlaps("labels.`a"));
+        assert!(labels.overlaps("labels"));
+        assert!(!labels.overlaps("labels.`a.c"));
+        assert!(FieldMask::from_paths([""]).overlaps(".user"));
+        assert!(!FieldMask::from_paths([""]).overlaps("user"));
+        let trailing = FieldMask::from_paths(["user."]);
+        assert!(trailing.overlaps("user"));
+        assert!(!trailing.covers("user"));
+        assert!(!trailing.overlaps("user.name"));
+    }
+
+    #[test]
+    fn covers_treats_every_dot_as_a_component_boundary() {
+        // An empty path, a trailing dot and a backtick-quoted map key get no
+        // special handling: a path is its text, split at each dot.
+        let mask = FieldMask::from_paths(["user", "labels.`a.b`"]);
+        assert!(mask.covers("user."));
+        assert!(mask.covers("user..name"));
+        assert!(!mask.covers("user`"));
+        assert!(mask.covers("labels.`a.b`"));
+        assert!(mask.covers("labels.`a.b`.c"));
+        assert!(!mask.covers("labels.`a"));
+        assert!(!mask.covers("labels.`a.b"));
+        assert!(FieldMask::from_paths(["labels.`a"]).covers("labels.`a.b`"));
+
+        let trailing = FieldMask::from_paths(["user."]);
+        assert!(trailing.covers("user."));
+        assert!(trailing.covers("user..name"));
+        assert!(!trailing.covers("user"));
+        assert!(!trailing.covers("user.name"));
+
+        let empty_path = FieldMask::from_paths([""]);
+        assert!(empty_path.covers(""));
+        assert!(empty_path.covers(".user"));
+        assert!(!empty_path.covers("user"));
+    }
+
+    #[test]
+    fn normalize_reads_empty_components_and_backticks_as_plain_text() {
+        let mut mask =
+            FieldMask::from_paths(["user.", "user", "", "labels.`a.b`.c", "labels.`a.b`", "*"]);
+        mask.normalize();
+        assert_eq!(mask.paths, ["", "*", "labels.`a.b`", "user"]);
+
+        // `user.` is a child of `user` with an empty name, not a parent of
+        // `user.name`.
+        let mut mask = FieldMask::from_paths(["user.name", "user."]);
+        mask.normalize();
+        assert_eq!(mask.paths, ["user.", "user.name"]);
+    }
+
+    #[test]
+    fn normalize_removes_duplicates_and_redundant_descendants() {
+        let mut mask = FieldMask::from_paths([
+            "user.name.first",
+            "settings.theme",
+            "user.name",
+            "user",
+            "user",
+            "settings.theme.color",
+            "settings.locale",
+            "username",
+            "user_name",
+        ]);
+        mask.normalize();
+        assert_eq!(
+            mask.paths,
+            [
+                "settings.locale",
+                "settings.theme",
+                "user",
+                "user_name",
+                "username"
+            ]
+        );
+        let once = mask.clone();
+        mask.normalize();
+        assert_eq!(mask, once);
+    }
+
+    #[test]
+    fn normalize_handles_empty_masks_and_component_ordering() {
+        let mut empty = FieldMask::default();
+        empty.normalize();
+        assert!(empty.is_empty());
+
+        // A bytewise sort would put `a-b` between `a` and `a.b`, hiding
+        // the parent from adjacent deduplication. Paths are not validated.
+        let mut mask = FieldMask::from_paths(["a.b", "a-b", "a", "é.child", "é"]);
+        mask.normalize();
+        assert_eq!(mask.paths, ["a", "a-b", "é"]);
+    }
+
+    #[test]
+    fn normalize_preserves_unknown_fields() {
+        use buffa::Message;
+
+        // Unknown field 2, varint 42, alongside two paths covered by `a`.
+        let mut mask =
+            FieldMask::decode(&mut &[0x0a, 3, b'a', b'.', b'b', 0x10, 42, 0x0a, 1, b'a'][..])
+                .unwrap();
+        let unknown = mask.__buffa_unknown_fields.clone();
+        mask.normalize();
+        assert_eq!(mask.paths, ["a"]);
+        assert_eq!(mask.__buffa_unknown_fields, unknown);
+        assert_eq!(
+            FieldMask::decode(&mut mask.encode_to_vec().as_slice()).unwrap(),
+            mask
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_coverage_and_leaves_no_covered_path_for_every_subset() {
+        // In reverse component order, so that every subset needs the sort.
+        let paths = [
+            "b.c", "b", "a_b", "a-b", "a.bc", "a.b.c", "a.b", "a.", "a", "",
+        ];
+        for subset in 0..(1 << paths.len()) {
+            let original = FieldMask::from_paths(
+                paths
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| subset & (1 << i) != 0)
+                    .map(|(_, path)| *path),
+            );
+            let mut normalized = original.clone();
+            normalized.normalize();
+            for query in paths
+                .into_iter()
+                .chain(["a.b.c.d", "a.bcd", "b.c.d", "c", ".a"])
+            {
+                assert_eq!(
+                    normalized.covers(query),
+                    original.covers(query),
+                    "subset {subset}, query {query}"
+                );
+            }
+            for (i, path) in normalized.paths.iter().enumerate() {
+                for (j, other) in normalized.paths.iter().enumerate() {
+                    assert!(
+                        i == j || !path_is_covered(path, other),
+                        "subset {subset}: {other} covers {path}"
+                    );
+                }
+            }
+            assert!(
+                normalized
+                    .paths
+                    .windows(2)
+                    .all(|w| w[0].split('.').lt(w[1].split('.'))),
+                "subset {subset}: {:?} is not in component order",
+                normalized.paths
+            );
+        }
     }
 
     #[cfg(feature = "json")]

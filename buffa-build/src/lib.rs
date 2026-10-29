@@ -24,8 +24,10 @@
 //!
 //! If `protoc` is unavailable or outdated on your platform, `buf` can be
 //! used instead — see [`Config::use_buf()`]. Alternatively, feed a
-//! pre-compiled descriptor set via [`Config::descriptor_set()`].
+//! pre-compiled descriptor set via [`Config::descriptor_set()`] (a file) or
+//! [`Config::descriptor_set_bytes()`] (in-memory bytes).
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
@@ -39,7 +41,7 @@ pub use buffa_codegen::FeatureGateNames;
 #[doc(inline)]
 pub use buffa_codegen::ReflectMode;
 #[doc(inline)]
-pub use buffa_codegen::{BytesRepr, MapRepr, PointerRepr, RepeatedRepr, StringRepr};
+pub use buffa_codegen::{BytesRepr, CodecStrategy, MapRepr, PointerRepr, RepeatedRepr, StringRepr};
 #[doc(inline)]
 pub use buffa_codegen::{EnumTypeOverride, FeatureOverride};
 
@@ -53,6 +55,8 @@ enum DescriptorSource {
     Buf,
     /// Read a pre-built `FileDescriptorSet` from a file.
     Precompiled(PathBuf),
+    /// Use a pre-built `FileDescriptorSet` already in memory.
+    Bytes(Vec<u8>),
 }
 
 /// Builder for configuring and running protobuf compilation.
@@ -90,6 +94,9 @@ impl Config {
     }
 
     /// Add include directories for protoc to search for imports.
+    ///
+    /// Directories are searched in order. If directories overlap, the first
+    /// matching directory determines the proto-relative file name.
     #[must_use]
     pub fn includes(mut self, includes: &[impl AsRef<Path>]) -> Self {
         self.includes
@@ -183,6 +190,9 @@ impl Config {
     ///
     /// The derive is gated behind `#[cfg_attr(feature = "arbitrary", ...)]`
     /// so the downstream crate compiles with or without the feature enabled.
+    /// An enum with a `[deprecated = true]` variant gets a generated impl
+    /// under the same gate instead, because the derive would warn on that
+    /// variant. The impl maps input to variants as the derive does.
     ///
     /// Your crate's Cargo feature **must be named exactly `"arbitrary"`** —
     /// the generated `cfg_attr` uses that literal string and cannot be
@@ -193,15 +203,93 @@ impl Config {
     /// arbitrary = ["dep:arbitrary", "buffa/arbitrary"]
     /// ```
     ///
-    /// Forgetting `"buffa/arbitrary"` produces a confusing
-    /// `cannot find function 'arbitrary_bytes' in module '__private'` error
-    /// in generated code when [`use_bytes_type`](Self::use_bytes_type) or
-    /// [`use_bytes_type_in`](Self::use_bytes_type_in) is also enabled,
-    /// because the helper that backs `#[arbitrary(with = ...)]` for
-    /// `bytes::Bytes` fields lives in `buffa` under that feature gate.
+    /// Forgetting `"buffa/arbitrary"` produces a confusing error in generated
+    /// code, such as ``cannot find function `arbitrary_proto_bytes` in module
+    /// `buffa::__private` ``, when a `string_type` or `bytes_type` rule selects
+    /// a non-default type: the functions that back `#[arbitrary(with = ...)]`
+    /// on those fields live in `buffa` under that feature gate.
     #[must_use]
     pub fn generate_arbitrary(mut self, enabled: bool) -> Self {
         self.codegen_config.generate_arbitrary = enabled;
+        self
+    }
+
+    /// Omit the generated `Debug` implementation for the matching messages
+    /// and enums, so that your crate can write its own.
+    ///
+    /// Each path is a fully-qualified proto path. For messages it is a
+    /// prefix: `".demo.Uuid4"` names that message and the messages nested
+    /// inside it, `".demo"` every message in the package and its
+    /// sub-packages, and `"."` every message. A matched message's oneof
+    /// enums lose their `Debug` with it. An enum loses its `Debug` only when
+    /// a path is its exact name, such as `".demo.Level"`: a message or
+    /// package path leaves the enums under it as they are. A leading dot is
+    /// added if missing and trailing dots are trimmed. Repeated calls
+    /// accumulate.
+    ///
+    /// View types keep their generated `Debug`, so a view still prints every
+    /// field. To hide a field's value in all generated `Debug` output, use
+    /// the `[debug_redact = true]` field option instead. That option does
+    /// not reach a matched message or oneof: your impl decides what it
+    /// prints.
+    ///
+    /// Your crate then implements `Debug`:
+    ///
+    /// - for every matched enum, because [`buffa::Enumeration`] requires it;
+    /// - for a matched message that an unmatched message or oneof holds
+    ///   (their generated `Debug` formats it), that is generated with
+    ///   reflection, or that a custom `repeated_type` collection holds;
+    /// - for a matched message's oneof enum, if your `Debug` for the message
+    ///   prints it. For a oneof `kind` in `demo.Uuid4` the enum is
+    ///   `demo::uuid4::Kind`.
+    ///
+    /// A missing impl is a compile error. For an enum it is error E0277
+    /// (`Level` doesn't implement `Debug`) at the generated
+    /// `impl ::buffa::Enumeration for Level`. A path that matches no
+    /// generated message and names no generated enum prints a
+    /// `cargo:warning`.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // build.rs
+    /// buffa_build::Config::new()
+    ///     .files(&["proto/demo.proto"])
+    ///     .includes(&["proto/"])
+    ///     .skip_debug(&[".demo.Uuid4", ".demo.Level"])
+    ///     .compile()?;
+    ///
+    /// // src/lib.rs
+    /// pub mod demo {
+    ///     buffa::include_proto!("demo");
+    /// }
+    ///
+    /// impl core::fmt::Debug for demo::Uuid4 {
+    ///     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    ///         write!(f, "Uuid4({:016x}{:016x})", self.msb, self.lsb)
+    ///     }
+    /// }
+    ///
+    /// // Prints the value's proto name, as the derive it replaces does.
+    /// impl core::fmt::Debug for demo::Level {
+    ///     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    ///         f.write_str(buffa::Enumeration::proto_name(self))
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn skip_debug(mut self, paths: &[impl AsRef<str>]) -> Self {
+        for raw in paths.iter().map(AsRef::as_ref) {
+            let normalized = normalize_override_path(raw);
+            if normalized.is_empty() {
+                println!(
+                    "cargo:warning=buffa: skip_debug path '{raw}' \
+                     normalizes to empty and will be ignored"
+                );
+                continue;
+            }
+            self.codegen_config.skip_debug.push(normalized);
+        }
         self
     }
 
@@ -544,7 +632,8 @@ impl Config {
     /// Requires [`include_file`](Self::include_file) (the shared module is
     /// emitted into that file at the tree root) and reflection to be enabled;
     /// [`compile`](Self::compile) errors otherwise. The include file name must
-    /// be a bare file name, not a path. See
+    /// be a bare file name, not a path: the sidecar is named after the stem
+    /// alone, so `a/gen.rs` and `b/gen.rs` would share one sidecar. See
     /// [`CodeGenConfig::shared_descriptor_pool`].
     ///
     /// In this mode the generated tree must be consumed *through the include
@@ -988,10 +1077,15 @@ impl Config {
     /// values in bytes-keyed maps; ordinary message containers use serde
     /// directly.
     ///
-    /// A misconfigured mapping (a typo'd FQN target, a non-absolute
-    /// `rust_path`, or a view-referenced type mapped to a non-buffa crate) is
-    /// not diagnosed at generation time; it surfaces as an unresolved-path
-    /// error when the generated code is compiled.
+    /// `proto_path` is `.` or a dotted protobuf package or type name. The
+    /// leading dot is optional and one trailing dot is ignored;
+    /// [`compile`](Self::compile) returns an error for a name with an empty
+    /// segment (`my..common`) or a segment that is not a protobuf identifier.
+    ///
+    /// Other misconfigurations (a typo'd FQN target, a non-absolute
+    /// `rust_path`, or a view-referenced type mapped to a non-buffa crate)
+    /// are not diagnosed at generation time; they surface as an
+    /// unresolved-path error when the generated code is compiled.
     ///
     /// # Example
     ///
@@ -1013,15 +1107,12 @@ impl Config {
         proto_path: impl Into<String>,
         rust_path: impl Into<String>,
     ) -> Self {
-        let mut proto_path = proto_path.into();
-        // Normalize: ensure the proto path is fully-qualified (leading dot).
-        // Accept both ".my.package" and "my.package" for convenience.
-        if !proto_path.starts_with('.') {
-            proto_path.insert(0, '.');
-        }
+        // Stored as given: `compile` validates the name and normalizes it to
+        // the fully-qualified form (".my.package" for "my.package"), so its
+        // error can quote what the caller wrote.
         self.codegen_config
             .extern_paths
-            .push((proto_path, rust_path.into()));
+            .push((proto_path.into(), rust_path.into()));
         self
     }
 
@@ -1077,7 +1168,9 @@ impl Config {
     ///
     /// Each path is a fully-qualified proto path prefix. Use `"."` to apply
     /// to all bytes fields, or specify individual field paths like
-    /// `".my.pkg.MyMessage.data"`.
+    /// `".my.pkg.MyMessage.data"`. Path normalization and the warning for a
+    /// rule that matches nothing are as described on
+    /// [`bytes_type_in`](Self::bytes_type_in).
     ///
     /// Applies uniformly to singular, optional, repeated, oneof, **and
     /// `map<K, bytes>`** values — the map case lets `view → owned`
@@ -1133,6 +1226,17 @@ impl Config {
     /// proto path prefixes. The bytes counterpart to
     /// [`string_type_in`](Self::string_type_in).
     ///
+    /// Each path is a fully-qualified proto path prefix: a field
+    /// (`".my.pkg.Msg.data"`), a message, a package, or `"."` for every field.
+    /// A leading dot is added to each path if missing, surrounding whitespace
+    /// and trailing dots are ignored, and a blank entry is skipped with a
+    /// `cargo:warning`.
+    ///
+    /// A rule whose path does not match a field of any type in a generated
+    /// message produces a `cargo:warning`
+    /// ([`CodeGenWarning::FieldTypeRuleMatchedNothing`](buffa_codegen::CodeGenWarning::FieldTypeRuleMatchedNothing)).
+    /// A path that matches only fields of another type does not warn.
+    ///
     /// Rules accumulate and the **last** matching rule wins, so call the broad
     /// [`bytes_type`](Self::bytes_type) *first*, then `bytes_type_in` for
     /// narrower overrides. For [`BytesRepr::Custom`], the downstream crate must
@@ -1141,9 +1245,11 @@ impl Config {
     /// types still borrow `&[u8]`.
     #[must_use]
     pub fn bytes_type_in(mut self, repr: BytesRepr, paths: &[impl AsRef<str>]) -> Self {
-        self.codegen_config
-            .bytes_fields
-            .extend(paths.iter().map(|p| (p.as_ref().to_string(), repr.clone())));
+        self.codegen_config.bytes_fields.extend(
+            field_rule_paths("bytes_type_in", paths)
+                .into_iter()
+                .map(|path| (path, repr.clone())),
+        );
         self
     }
 
@@ -1204,8 +1310,8 @@ impl Config {
     /// Each path is a fully-qualified proto variant path prefix, e.g.
     /// `".my.pkg.MyMessage.body.small"` for one variant or `".my.pkg"` for a
     /// package (same matching as [`use_bytes_type_in`](Self::use_bytes_type_in)).
-    /// A leading dot is added if missing, mirroring
-    /// [`extern_path`](Self::extern_path).
+    /// Paths are normalized as for [`bytes_type_in`](Self::bytes_type_in). A
+    /// rule that matches no variant is not reported.
     ///
     /// Recursive variants cannot be stored inline (the type would be
     /// unsized). A rule that names a recursive variant *exactly* is rejected
@@ -1218,16 +1324,9 @@ impl Config {
     pub fn unbox_oneof_in(mut self, paths: &[impl AsRef<str>]) -> Self {
         self.codegen_config
             .unboxed_oneof_fields
-            .extend(paths.iter().map(|p| {
-                let p = p.as_ref();
-                // Normalize to the leading-dot form: matching and the
-                // exact-path recursion error both depend on it.
-                if p.starts_with('.') {
-                    p.to_string()
-                } else {
-                    format!(".{p}")
-                }
-            }));
+            // The exact-path recursion error compares against the normalized
+            // form.
+            .extend(field_rule_paths("unbox_oneof_in", paths));
         self
     }
 
@@ -1260,9 +1359,12 @@ impl Config {
     /// (orphan rule) — point at a local newtype, or the `buffa-smolstr` crate for
     /// `smol_str::SmolStr`.
     ///
-    /// Only the owned Rust type changes: the wire format is unchanged, view
-    /// types still borrow `&str`, and `map<_, string>` keys and values stay
-    /// `String`.
+    /// Only the owned Rust type changes: the wire format is unchanged and view
+    /// types still borrow `&str`. A rule that matches a `map` field applies to
+    /// its `string` key and its `string` value.
+    ///
+    /// Path normalization and the warning for a rule that matches nothing are
+    /// as described on [`bytes_type_in`](Self::bytes_type_in).
     ///
     /// # Example
     ///
@@ -1277,9 +1379,11 @@ impl Config {
     /// ```
     #[must_use]
     pub fn string_type_in(mut self, repr: StringRepr, paths: &[impl AsRef<str>]) -> Self {
-        self.codegen_config
-            .string_fields
-            .extend(paths.iter().map(|p| (p.as_ref().to_string(), repr.clone())));
+        self.codegen_config.string_fields.extend(
+            field_rule_paths("string_type_in", paths)
+                .into_iter()
+                .map(|path| (path, repr.clone())),
+        );
         self
     }
 
@@ -1288,7 +1392,8 @@ impl Config {
     /// Convenience for `.string_type_in(repr, &["."])`. Call this *before* any
     /// [`string_type_in`](Self::string_type_in) overrides, since the last
     /// matching rule wins (a `"."` rule added later shadows earlier specific
-    /// rules). `map<_, string>` keys and values stay `String`.
+    /// rules). The rule also covers the `string` keys and values of `map`
+    /// fields.
     #[must_use]
     pub fn string_type(mut self, repr: StringRepr) -> Self {
         self.codegen_config
@@ -1306,28 +1411,35 @@ impl Config {
     ///
     /// # Limitations
     ///
-    /// - A **foreign** custom type used as a `repeated` element fails to compile:
-    ///   codegen emits a `ReflectElement` impl for it, which the orphan rule
-    ///   forbids for a foreign type. Wrap it in a crate-local newtype for the
-    ///   repeated case; singular / optional / oneof uses work directly.
-    /// - **JSON of a `repeated` custom string** serializes elements through their
-    ///   native `serde`, so such a type must derive `Serialize` / `Deserialize`
-    ///   (and an external type must enable its `serde` feature). Singular /
-    ///   optional / oneof custom strings use the `proto_string` with-module and
-    ///   need no `serde` impl.
+    /// - Under vtable reflection ([`reflect_mode`](Self::reflect_mode) with
+    ///   `ReflectMode::VTable`), a **foreign** custom type used as a `repeated`
+    ///   element or as a `map` key or value fails to compile: codegen emits a
+    ///   `ReflectElement` or `ReflectMapKey` impl for it, which the orphan rule
+    ///   forbids for a foreign type. Wrap it in a crate-local newtype for
+    ///   those cases; singular / optional / oneof uses work directly.
+    /// - **JSON of a custom string with explicit presence (proto3 or proto2
+    ///   `optional`, and the edition 2023 default), in a `repeated` field, in
+    ///   a oneof, or in a `map`,** serializes through the type's own `serde`
+    ///   impls, so such a type must implement `Serialize` / `Deserialize`. A
+    ///   `buffa-remote-derive` newtype gets them from
+    ///   `#[buffa(remote = ..., serde)]`; any other type derives them (an
+    ///   external type enables its `serde` feature). A singular field with
+    ///   implicit presence, or a proto2 `required` field, uses the
+    ///   `proto_string` with-module and needs no `serde` impl.
+    /// - A custom type used as a `map` key must implement `Hash + Eq` for the
+    ///   default `HashMap` container, or `Ord` for `BTreeMap`.
     /// - A `path` that does not parse as a Rust type is reported as a codegen
     ///   error from [`compile`](Self::compile).
     /// - A custom string type needs no native `arbitrary::Arbitrary` impl (a
-    ///   generic builder handles it under `generate_arbitrary`).
+    ///   generic builder handles it under `generate_arbitrary`, as a `map` key
+    ///   or value too).
     #[must_use]
     pub fn string_type_custom_in(self, path: &str, paths: &[impl AsRef<str>]) -> Self {
         self.string_type_in(StringRepr::Custom(path.to_string()), paths)
     }
 
     /// Map every `string` field to the given custom type path. Convenience for
-    /// `.string_type_custom_in(path, &["."])`; see it for the limitations
-    /// (foreign `repeated` elements, the `repeated` JSON `serde` requirement,
-    /// path parsing).
+    /// `.string_type_custom_in(path, &["."])`; see it for the limitations.
     #[must_use]
     pub fn string_type_custom(self, path: &str) -> Self {
         self.string_type(StringRepr::Custom(path.to_string()))
@@ -1337,6 +1449,9 @@ impl Config {
     /// `HashMap`. Rules are matched with proto-segment-aware prefix logic; the
     /// **last** matching rule wins, so add a broad rule first and narrower
     /// overrides after.
+    ///
+    /// Path normalization and the warning for a rule that matches nothing are
+    /// as described on [`bytes_type_in`](Self::bytes_type_in).
     ///
     /// Use [`MapRepr::BTreeMap`] for the buffa-provided `BTreeMap` (deterministic
     /// key order, no extra dependency, no consumer code), or
@@ -1357,9 +1472,11 @@ impl Config {
     /// ```
     #[must_use]
     pub fn map_type_in(mut self, repr: MapRepr, paths: &[impl AsRef<str>]) -> Self {
-        self.codegen_config
-            .map_fields
-            .extend(paths.iter().map(|p| (p.as_ref().to_string(), repr.clone())));
+        self.codegen_config.map_fields.extend(
+            field_rule_paths("map_type_in", paths)
+                .into_iter()
+                .map(|path| (path, repr.clone())),
+        );
         self
     }
 
@@ -1370,6 +1487,61 @@ impl Config {
     #[must_use]
     pub fn map_type(mut self, repr: MapRepr) -> Self {
         self.codegen_config.map_fields.push((".".to_string(), repr));
+        self
+    }
+
+    /// Encode map entries as prost does: leave an entry's key or value out
+    /// when it holds the default (default: false, both are always written, as
+    /// the C++ and Java runtimes write them). Entries themselves are never
+    /// dropped.
+    ///
+    /// For migrations from prost where stored or hashed map encodings must
+    /// not change. Decoding is unchanged: buffa, like every protobuf runtime,
+    /// reads both forms to the same map. One value does not survive the round
+    /// trip: a `-0.0` float value is left out, as prost leaves it out, and
+    /// decodes as `0.0`.
+    ///
+    /// The default is what a missing field decodes to: zero, `false`, empty,
+    /// an open enum's 0 or a closed enum's first value. A message value is
+    /// left out when it encodes to nothing.
+    ///
+    /// # Differences from prost
+    ///
+    /// - prost leaves out a message value equal to its default. A value that
+    ///   equals its default and still encodes a field, such as one with a
+    ///   `required` field at its default or a float field holding `-0.0`, is
+    ///   written here and not by prost.
+    /// - A value of an enum made open with
+    ///   [`open_enums_in`](Self::open_enums_in) is left out at 0, which a
+    ///   missing open enum decodes to, where prost leaves out the enum's
+    ///   first value. The two differ only for an enum whose first value is
+    ///   not 0. protoc rejects that as a map value, so the case can occur
+    ///   only with a descriptor set that another tool built
+    ///   ([`use_buf`](Self::use_buf), [`descriptor_set`](Self::descriptor_set)).
+    /// - The option covers the entries' bytes only. For a map with more than
+    ///   one entry to encode identically, the entries must also come in the
+    ///   same order: use [`map_type`](Self::map_type) with
+    ///   [`MapRepr::BTreeMap`] where prost used `btree_map`.
+    ///
+    /// # Scope
+    ///
+    /// - The option applies to the owned, view and lazy view encoders of the
+    ///   messages generated in this run. Each crate's types encode as that
+    ///   crate was generated.
+    /// - `google.protobuf.Struct`, the well-known type with a map field,
+    ///   comes from `buffa-types` and writes both fields, and so does
+    ///   `DynamicMessage`.
+    /// - A lazy view keeps its singular and repeated message fields undecoded
+    ///   and writes them as they were read, so map entries inside them keep
+    ///   the encoding they arrived with. Every encoder writes entries kept as
+    ///   unknown fields as they were read.
+    /// - With [`CodecStrategy::Table`], messages with a map field keep the
+    ///   unrolled codec, and a
+    ///   [`codec_strategy_in`](Self::codec_strategy_in) rule that selects the
+    ///   table for such a message by its exact path is an error.
+    #[must_use]
+    pub fn map_entries_omit_defaults(mut self, enabled: bool) -> Self {
+        self.codegen_config.map_entries_omit_defaults = enabled;
         self
     }
 
@@ -1408,8 +1580,10 @@ impl Config {
     /// Map the matching message fields to a [`PointerRepr`] other than the
     /// default `Inline`. Rules are matched with proto-segment-aware prefix
     /// logic; the **last** matching rule wins, so add a broad rule first and
-    /// narrower overrides after. A leading dot is added to each path if
-    /// missing.
+    /// narrower overrides after.
+    ///
+    /// Paths are normalized as for [`bytes_type_in`](Self::bytes_type_in). A
+    /// rule that matches no field is not reported.
     ///
     /// The default `Inline` is recursion-aware (recursive fields stay on
     /// `Box`), so this knob is for opting *out*: `PointerRepr::Box` for large
@@ -1432,17 +1606,82 @@ impl Config {
     pub fn box_type_in(mut self, repr: PointerRepr, paths: &[impl AsRef<str>]) -> Self {
         self.codegen_config
             .pointer_fields
-            .extend(paths.iter().map(|p| {
-                let p = p.as_ref();
-                // Normalize to the leading-dot form: matching and the
-                // exact-path Inline recursion error both depend on it.
-                let p = if p.starts_with('.') {
-                    p.to_string()
-                } else {
-                    format!(".{p}")
-                };
-                (p, repr.clone())
-            }));
+            // The exact-path Inline recursion error compares against the
+            // normalized form.
+            .extend(
+                field_rule_paths("box_type_in", paths)
+                    .into_iter()
+                    .map(|path| (path, repr.clone())),
+            );
+        self
+    }
+
+    /// Choose how the binary `Message` implementation of every message is
+    /// generated (default: [`CodecStrategy::Unrolled`]).
+    ///
+    /// On a large schema, [`CodecStrategy::Table`] makes the compiled code
+    /// about 40% smaller at `opt-level = "z"`, and it slows messages made of
+    /// many small fields; a message that cannot use it keeps its size.
+    /// [`CodecStrategy::Table`] says which messages stay unrolled and how a
+    /// table message behaves differently, and this build reports the messages
+    /// that stay unrolled in one `cargo:warning`. The option never changes the
+    /// wire format. The generated code needs Rust 1.77 or later, and `compile`
+    /// returns an error on an older compiler when a build script runs it (the
+    /// compiler is read from `RUSTC`).
+    ///
+    /// Path-scoped rules for individual messages go in
+    /// [`codec_strategy_in`](Self::codec_strategy_in), and take precedence
+    /// over this setting whatever the call order.
+    ///
+    /// ```rust,ignore
+    /// // build.rs
+    /// buffa_build::Config::new()
+    ///     .files(&["proto/wa.proto"])
+    ///     .includes(&["proto/"])
+    ///     .codec_strategy(buffa_build::CodecStrategy::Table)
+    ///     .codec_strategy_in(buffa_build::CodecStrategy::Unrolled, &[".wa.Message"])
+    ///     .compile()?;
+    /// ```
+    #[must_use]
+    pub fn codec_strategy(mut self, strategy: CodecStrategy) -> Self {
+        self.codegen_config.codec_strategy = strategy;
+        self
+    }
+
+    /// Choose the [`CodecStrategy`] of the matching messages, on top of the
+    /// global [`codec_strategy`](Self::codec_strategy).
+    ///
+    /// Each path is a fully-qualified proto path prefix, e.g. `".wa.Message"`
+    /// for one message or `".wa"` for a package (same matching as
+    /// [`preserve_unknown_fields_in`](Self::preserve_unknown_fields_in));
+    /// `"."` matches every message. A leading dot is added if missing,
+    /// trailing dots are trimmed, and a path that is empty after that prints a
+    /// `cargo:warning` and is ignored. A rule covers the message it names
+    /// **and every message nested inside it**. The **last** matching rule wins,
+    /// so call this after any broader rule.
+    ///
+    /// A message selected for the table by a rule that cannot use it stays
+    /// unrolled and is counted in the warning, and it is an error if the rule
+    /// names the message by its exact path. A rule that matches no message
+    /// produces a warning.
+    ///
+    /// A rule does not extend to the messages a message holds; see
+    /// [`CodecStrategy::Table`].
+    #[must_use]
+    pub fn codec_strategy_in(mut self, strategy: CodecStrategy, paths: &[impl AsRef<str>]) -> Self {
+        for raw in paths.iter().map(AsRef::as_ref) {
+            let normalized = normalize_override_path(raw);
+            if normalized.is_empty() {
+                println!(
+                    "cargo:warning=buffa: codec_strategy_in path '{raw}' \
+                     normalizes to empty and will be ignored"
+                );
+                continue;
+            }
+            self.codegen_config
+                .codec_strategy_in
+                .push((normalized, strategy));
+        }
         self
     }
 
@@ -1491,6 +1730,9 @@ impl Config {
     /// logic; the **last** matching rule wins, so add a broad rule first and
     /// narrower overrides after. Applies only to `repeated` fields (not `map`).
     ///
+    /// Path normalization and the warning for a rule that matches nothing are
+    /// as described on [`bytes_type_in`](Self::bytes_type_in).
+    ///
     /// For [`RepeatedRepr::Custom`], the collection must implement
     /// `buffa::ProtoList<T>`. Unlike the scalar `string_type_custom` /
     /// `bytes_type_custom` knobs (which take a *complete* type path), this path
@@ -1514,9 +1756,11 @@ impl Config {
     /// ```
     #[must_use]
     pub fn repeated_type_in(mut self, repr: RepeatedRepr, paths: &[impl AsRef<str>]) -> Self {
-        self.codegen_config
-            .repeated_fields
-            .extend(paths.iter().map(|p| (p.as_ref().to_string(), repr.clone())));
+        self.codegen_config.repeated_fields.extend(
+            field_rule_paths("repeated_type_in", paths)
+                .into_iter()
+                .map(|path| (path, repr.clone())),
+        );
         self
     }
 
@@ -1578,10 +1822,12 @@ impl Config {
     /// trailing `.` is trimmed. Prefix matching respects proto-segment
     /// boundaries, so `".my.pk"` does not match `".my.pkg.Msg"`.
     ///
-    /// `attribute` is a raw Rust attribute string
-    /// (e.g., `"#[derive(serde::Serialize)]"`). A malformed attribute
-    /// produces [`CodeGenError::InvalidCustomAttribute`](buffa_codegen::CodeGenError)
-    /// at compile time rather than being silently dropped.
+    /// `attribute` is one or more outer Rust attributes, each written with
+    /// its `#[...]` (e.g., `"#[derive(serde::Serialize)]"`). Any other
+    /// string, such as `"serde(skip)"` or an empty one, makes
+    /// [`compile`](Self::compile) fail with
+    /// [`CodeGenError::InvalidCustomAttribute`](buffa_codegen::CodeGenError),
+    /// whether or not `path` matches a generated type.
     ///
     /// Multiple calls accumulate in insertion order — all matching attributes
     /// are emitted, and ordering is preserved in generated code.
@@ -1598,10 +1844,21 @@ impl Config {
     /// `type_attribute(".", "#[derive(Clone)]")` produces a compile error in
     /// the generated code.
     ///
+    /// A custom `serde::Serialize` derive has two additional requirements:
+    /// messages must disable unknown-field preservation because
+    /// `UnknownFields` does not implement `serde::Serialize`, and the `json`
+    /// feature must be enabled for buffa's `EnumValue` and `MessageField`
+    /// serde implementations. Do not combine a custom derive with
+    /// [`generate_json(true)`](Self::generate_json), which already generates
+    /// the message's serde implementations.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
     /// buffa_build::Config::new()
+    ///     // `UnknownFields` does not implement `serde::Serialize`; with this
+    ///     // off, unknown fields are dropped on decode.
+    ///     .preserve_unknown_fields(false)
     ///     .type_attribute(".", "#[derive(serde::Serialize)]")
     ///     .type_attribute(".my.pkg.MyEnum", "#[derive(strum::EnumIter)]")
     ///     .files(&["proto/my_service.proto"])
@@ -1626,7 +1883,35 @@ impl Config {
     /// Prefix matching respects proto-segment boundaries.
     ///
     /// Also applies to oneof variants when `path` matches
-    /// `".pkg.Msg.my_oneof.variant_name"`.
+    /// `".pkg.Msg.my_oneof.variant_name"`, but not to the struct field holding
+    /// the oneof; use
+    /// [`oneof_struct_field_attribute`](Self::oneof_struct_field_attribute) for
+    /// that.
+    ///
+    /// `attribute` follows the rule given for
+    /// [`type_attribute`](Self::type_attribute): any string that is not one
+    /// or more `#[...]` attributes, an empty one included, makes
+    /// [`compile`](Self::compile) fail.
+    ///
+    /// A `#[deprecated]` supplied here wins over the one codegen derives from
+    /// the field's `[deprecated = true]` option — rustc permits only one
+    /// `deprecated` attribute per item — so this is also how to attach a note
+    /// naming the replacement. Either source marks every generated way to
+    /// reach a message field: the `with_*` setter, the same field on the
+    /// views, its `OwnedView` accessor and, for a `required` field, the views'
+    /// `has_*` method. Those carry a bare `#[deprecated]`; the attribute given
+    /// here, with its note, stays on the owned struct's field. Either source
+    /// also makes the generated items that visit the field carry
+    /// `#[allow(deprecated)]`.
+    ///
+    /// A `deprecated` inside `cfg_attr` counts too: it replaces the
+    /// option-derived marker on the owned field, and the setter and view
+    /// markers stay unconditional.
+    ///
+    /// A oneof variant gets only the attribute given here. Its view variant is
+    /// unmarked and the generated impls that match on it are not guarded, so
+    /// put `#[allow(deprecated)]` on the `mod` that includes the generated
+    /// file.
     ///
     /// # Example
     ///
@@ -1658,9 +1943,13 @@ impl Config {
     ///
     /// Same path-matching semantics as [`type_attribute`](Self::type_attribute) —
     /// leading `.` auto-prepended, trailing `.` trimmed, proto-segment-aware
-    /// prefix matching, accumulation in insertion order. A malformed attribute
-    /// produces a compile-time error. Useful for struct-only attributes like
-    /// `#[serde(default)]`.
+    /// prefix matching, accumulation in insertion order. Useful for
+    /// struct-only attributes like `#[serde(default)]`.
+    ///
+    /// `attribute` follows the rule given for
+    /// [`type_attribute`](Self::type_attribute): any string that is not one
+    /// or more `#[...]` attributes, an empty one included, makes
+    /// [`compile`](Self::compile) fail.
     ///
     /// # Example
     ///
@@ -1692,11 +1981,15 @@ impl Config {
     ///
     /// Same path-matching semantics as [`type_attribute`](Self::type_attribute) —
     /// leading `.` auto-prepended, trailing `.` trimmed, proto-segment-aware
-    /// prefix matching, accumulation in insertion order. A malformed attribute
-    /// produces a compile-time error. Useful when you want to inject an
-    /// attribute on every enum in a package without also matching the
-    /// (often more numerous) messages that share the path prefix — e.g.
+    /// prefix matching, accumulation in insertion order. Useful when you want
+    /// to inject an attribute on every enum in a package without also matching
+    /// the (often more numerous) messages that share the path prefix — e.g.
     /// `#[derive(strum::EnumIter)]`, which only makes sense on enums.
+    ///
+    /// `attribute` follows the rule given for
+    /// [`type_attribute`](Self::type_attribute): any string that is not one
+    /// or more `#[...]` attributes, an empty one included, makes
+    /// [`compile`](Self::compile) fail.
     ///
     /// # Example
     ///
@@ -1725,9 +2018,15 @@ impl Config {
     /// order. The match key is the oneof's fully-qualified path
     /// (`.my.pkg.MyMessage.my_oneof`) — the whole-enum path has no variant
     /// segment; to target a single variant's field, append `.variant_name`
-    /// and use [`field_attribute`](Self::field_attribute) instead. A
-    /// malformed attribute produces a compile-time error in the generated
-    /// code. Useful when a oneof needs a different attribute set than the
+    /// and use [`field_attribute`](Self::field_attribute) instead, and for the
+    /// message struct's field holding the oneof, use
+    /// [`oneof_struct_field_attribute`](Self::oneof_struct_field_attribute).
+    /// `attribute` follows the rule given for
+    /// [`type_attribute`](Self::type_attribute): any string that is not one
+    /// or more `#[...]` attributes, an empty one included, makes
+    /// [`compile`](Self::compile) fail.
+    ///
+    /// Useful when a oneof needs a different attribute set than the
     /// surrounding types — for example to keep `#[derive(serde::Serialize)]`
     /// on messages and oneofs while
     /// [`enum_attribute`](Self::enum_attribute) gives the regular enums a
@@ -1746,6 +2045,12 @@ impl Config {
     /// `Debug` derive with a manual impl). Re-deriving any of these via
     /// `oneof_attribute` produces a conflicting-implementation compile error
     /// inside the generated code.
+    ///
+    /// For the `serde::Serialize` requirements when the surrounding messages
+    /// also use a custom derive, see the [`type_attribute`](Self::type_attribute)
+    /// pitfalls: disable unknown-field preservation for messages and enable
+    /// the `json` feature for buffa's serde implementations. Do not combine
+    /// custom derives with [`generate_json(true)`](Self::generate_json).
     ///
     /// # Example
     ///
@@ -1766,6 +2071,105 @@ impl Config {
     ) -> Self {
         self.codegen_config
             .oneof_attributes
+            .push((normalize_attr_path(path.into()), attribute.into()));
+        self
+    }
+
+    /// Add a custom attribute to the message struct's field holding a oneof
+    /// (the `Option<OneofEnum>` member), not to the oneof's variants.
+    ///
+    /// The match key is the oneof's fully-qualified path
+    /// (`.my.pkg.MyMessage.my_oneof`), with the same path-matching semantics
+    /// as [`type_attribute`](Self::type_attribute): `".my.pkg"` reaches the
+    /// oneof field of every message in the package, nested ones included.
+    /// Attributes accumulate in insertion order, after buffa's own attributes
+    /// on the field.
+    ///
+    /// `attribute` follows the rule given for
+    /// [`type_attribute`](Self::type_attribute): any string that is not one
+    /// or more `#[...]` attributes, an empty one included, makes
+    /// [`compile`](Self::compile) fail.
+    ///
+    /// A rule on a variant's path (`.my.pkg.MyMessage.my_oneof.variant_name`)
+    /// does not match the oneof, so it has no effect, and the build does not
+    /// warn about it. Variants take their attributes from
+    /// [`field_attribute`](Self::field_attribute).
+    ///
+    /// Each of these lines of the generated code for a oneof takes its
+    /// attributes from a different method:
+    ///
+    /// ```rust,ignore
+    /// pub struct Event {
+    ///     // oneof_struct_field_attribute(".pkg.Event.payload", ..)
+    ///     pub payload: Option<event::Payload>,
+    /// }
+    ///
+    /// // oneof_attribute(".pkg.Event.payload", ..), or type_attribute on the same path
+    /// pub enum Payload {
+    ///     // field_attribute(".pkg.Event.payload.text", ..)
+    ///     Text(String),
+    /// }
+    /// ```
+    ///
+    /// `field_attribute` on the oneof's path (`.pkg.Event.payload`) matches
+    /// the variants only, where an attribute
+    /// such as `#[serde(skip_serializing_if = "...")]` is rejected. prost-build
+    /// puts such a `field_attribute` on the struct field as well; use this
+    /// method for the struct field.
+    ///
+    /// Applies to the owned message struct only; the view structs do not get
+    /// the attribute.
+    ///
+    /// A `#[deprecated]` given here marks the owned struct's field only. The
+    /// same field on the view structs stays unmarked, so reading the oneof
+    /// through a view does not warn, unlike a field deprecated through
+    /// `field_attribute`. The generated items that visit the owned field
+    /// carry `#[allow(deprecated)]`.
+    ///
+    /// # Pitfalls
+    ///
+    /// With [`generate_json(true)`](Self::generate_json) the field already
+    /// carries buffa's `#[serde(flatten)]` for the derived `Serialize`, and
+    /// buffa generates the `Deserialize` impl of a message with a oneof
+    /// instead of deriving it. So a serde attribute given here changes the
+    /// owned message's `Serialize` output only: `Deserialize` and the views'
+    /// `Serialize` ignore it. A second `flatten` is a compile error in the
+    /// generated code. Serde attributes here are for a serde derive that you
+    /// attach yourself, with `generate_json` off.
+    ///
+    /// With
+    /// [`gate_impls_on_crate_features(true)`](Self::gate_impls_on_crate_features)
+    /// buffa's serde derive is compiled only under the JSON feature. Write a
+    /// serde attribute for it as `#[cfg_attr(feature = "json", serde(...))]`,
+    /// with your JSON feature's name if you renamed it, so that it is compiled
+    /// under the same feature.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// buffa_build::Config::new()
+    ///     // `UnknownFields` does not implement `serde::Serialize`. With this
+    ///     // off, unknown fields are dropped on decode.
+    ///     .preserve_unknown_fields(false)
+    ///     .message_attribute(".my.pkg.MyMessage", "#[derive(serde::Serialize)]")
+    ///     .oneof_attribute(".my.pkg.MyMessage.my_oneof", "#[derive(serde::Serialize)]")
+    ///     .oneof_struct_field_attribute(
+    ///         ".my.pkg.MyMessage.my_oneof",
+    ///         "#[serde(skip_serializing_if = \"Option::is_none\")]",
+    ///     )
+    ///     .files(&["proto/my_service.proto"])
+    ///     .includes(&["proto/"])
+    ///     .compile()
+    ///     .unwrap();
+    /// ```
+    #[must_use]
+    pub fn oneof_struct_field_attribute(
+        mut self,
+        path: impl Into<String>,
+        attribute: impl Into<String>,
+    ) -> Self {
+        self.codegen_config
+            .oneof_struct_field_attributes
             .push((normalize_attr_path(path.into()), attribute.into()));
         self
     }
@@ -1829,9 +2233,53 @@ impl Config {
     ///
     /// When using this, `.files()` specifies which proto files in the
     /// descriptor set to generate code for (matching by proto file name).
+    /// For in-memory input, use [`descriptor_set_bytes()`](Self::descriptor_set_bytes).
     #[must_use]
     pub fn descriptor_set(mut self, path: impl Into<PathBuf>) -> Self {
         self.descriptor_source = DescriptorSource::Precompiled(path.into());
+        self
+    }
+
+    /// Use a serialized `google.protobuf.FileDescriptorSet` held in memory.
+    ///
+    /// Use this when the build script produces the descriptor set itself, for
+    /// example with an in-process compiler such as `protox`.
+    /// [`compile()`](Self::compile) decodes the bytes and does not invoke
+    /// `protoc` or `buf`. This replaces any previously configured descriptor
+    /// source. Pass a slice as `bytes.to_vec()`.
+    ///
+    /// [`files()`](Self::files) selects which proto files in the descriptor set
+    /// to generate, using their exact descriptor names (relative to the proto
+    /// source root). The set must also contain their transitive imports.
+    /// [`includes()`](Self::includes) is ignored.
+    ///
+    /// # Rebuilds
+    ///
+    /// Print a `cargo:rerun-if-changed` or `cargo:rerun-if-env-changed` line
+    /// for every input the bytes were built from. `buffa-build` cannot see
+    /// those inputs, and `compile()` always prints a `rerun-if-env-changed`
+    /// line of its own, which turns off Cargo's default of rerunning the build
+    /// script when any file in the package changes. Without your own lines, an
+    /// edited `.proto` file does not rerun the script, and the generated code
+    /// goes stale.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # fn compile_protos_in_process() -> Vec<u8> { Vec::new() }
+    /// # fn main() -> Result<(), Box<dyn std::error::Error>> {
+    /// let bytes: Vec<u8> = compile_protos_in_process();
+    /// println!("cargo:rerun-if-changed=proto");
+    /// buffa_build::Config::new()
+    ///     .descriptor_set_bytes(bytes)
+    ///     .files(&["api/v1/service.proto"])
+    ///     .compile()?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn descriptor_set_bytes(mut self, bytes: Vec<u8>) -> Self {
+        self.descriptor_source = DescriptorSource::Bytes(bytes);
         self
     }
 
@@ -1852,7 +2300,14 @@ impl Config {
     ///   `build.rs` via `include!(concat!(env!("OUT_DIR"), "/<name>"))`.
     /// - **Explicit `out_dir`**: emits sibling-relative `include!("foo.rs")`,
     ///   for checking the generated code into the source tree and referencing
-    ///   it as a module (e.g. `mod gen;`).
+    ///   it as a module (e.g. `mod gen;`). The include file then has to sit in
+    ///   `out_dir` itself: `name` must be a bare file name, and
+    ///   [`compile`](Self::compile) rejects a name with a directory part.
+    ///
+    /// With [`shared_descriptor_pool`](Self::shared_descriptor_pool), `name`
+    /// must be a bare file name in both modes. In `$OUT_DIR` mode without the
+    /// shared pool, `name` may have a directory part (`"nested/_include.rs"`),
+    /// and [`compile`](Self::compile) creates that directory.
     ///
     /// # Example — `build.rs` / `$OUT_DIR`
     ///
@@ -1899,15 +2354,48 @@ impl Config {
     /// - [`shared_descriptor_pool`](Self::shared_descriptor_pool) is set
     ///   without reflection enabled, without
     ///   [`include_file`](Self::include_file), or with an `include_file`
-    ///   lacking a file-name stem (the sidecar is named after it)
+    ///   that is not a bare file name or lacks a file-name stem
+    /// - an explicit [`out_dir`](Self::out_dir) is combined with an
+    ///   [`include_file`](Self::include_file) that is not a bare file name
     /// - `protoc` or `buf` cannot be found on `PATH` (when using those sources)
     /// - the proto compiler exits with a non-zero status (syntax errors,
     ///   missing imports, etc.)
     /// - a precompiled descriptor set file cannot be read
     /// - the descriptor set bytes cannot be decoded as a `FileDescriptorSet`
-    /// - code generation fails (e.g. unsupported proto feature)
+    /// - an [`extern_path`](Self::extern_path) proto name has an empty
+    ///   segment or a segment that is not a protobuf identifier
+    /// - a custom attribute string, given to
+    ///   [`type_attribute`](Self::type_attribute) or one of the five methods
+    ///   beside it, is not one or more `#[...]` attributes
+    /// - code generation fails (e.g. unsupported proto feature), including a
+    ///   [`codec_strategy_in`](Self::codec_strategy_in) rule that names by its
+    ///   exact path a message that cannot use the table codec
+    /// - [`CodecStrategy::Table`] is requested and the compiler is older than
+    ///   Rust 1.77
     /// - the output directory cannot be created or written to
-    pub fn compile(self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn compile(mut self) -> Result<(), Box<dyn std::error::Error>> {
+        // Table code needs `offset_of!`, stable in Rust 1.77. Say so once here,
+        // and not once per field in the compiler's output.
+        let table_codec_requested = self.codegen_config.codec_strategy == CodecStrategy::Table
+            || self
+                .codegen_config
+                .codec_strategy_in
+                .iter()
+                .any(|(_, strategy)| *strategy == CodecStrategy::Table);
+        // Outside a build script `RUSTC` is unset, and the toolchain that
+        // compiles the generated code is unknown, so it is not checked.
+        if table_codec_requested {
+            if let Some(minor) = rustc_minor_version() {
+                if minor < 77 {
+                    return Err(format!(
+                        "CodecStrategy::Table needs Rust 1.77 or later, and this build uses \
+                         1.{minor}; use a newer compiler or select CodecStrategy::Unrolled"
+                    )
+                    .into());
+                }
+            }
+        }
+
         // Reject malformed `exclude_package` entries before protoc runs; the
         // codegen normalizes them again, but a typo should not cost a protoc
         // invocation to surface.
@@ -1915,6 +2403,12 @@ impl Config {
             if let Err(e) = buffa_codegen::normalize_exclude_package(entry) {
                 return Err(format!("exclude_package {entry:?}: {e}").into());
             }
+        }
+
+        // Same for `extern_path`: a name that can match no type would leave
+        // the mapping silently unused. The plugin applies the same function.
+        for (proto, _) in &mut self.codegen_config.extern_paths {
+            *proto = buffa_codegen::normalize_extern_path_proto_name(proto)?;
         }
 
         // Validate the shared-pool prerequisites before doing any work, and
@@ -1940,17 +2434,33 @@ impl Config {
             // without one ("", ".", "..") here rather than writing a stray
             // misnamed sidecar before the include-file write fails. The stem
             // is computed once here and reused when the sidecar is written.
-            match Path::new(include_name).file_stem().and_then(|s| s.to_str()) {
-                Some(stem) => Some(format!("{stem}.descriptor_set.binpb")),
-                None => {
-                    return Err(format!(
-                        "shared_descriptor_pool requires include_file to have a file name \
-                         (the descriptor-set sidecar is named after its stem); \
-                         got {include_name:?}"
-                    )
-                    .into());
-                }
+            let Some(stem) = Path::new(include_name).file_stem().and_then(|s| s.to_str()) else {
+                return Err(format!(
+                    "shared_descriptor_pool requires include_file to have a file name \
+                     (the descriptor-set sidecar is named after its stem); \
+                     got {include_name:?}"
+                )
+                .into());
+            };
+            // The sidecar is named after the stem alone and written at the
+            // output root, so `a/gen.rs` and `b/gen.rs` from two compile()
+            // calls would share `gen.descriptor_set.binpb`, and the first tree
+            // would build its pool from the second tree's descriptors.
+            if !is_bare_file_name(include_name) {
+                let reason = if include_name.contains('\0') {
+                    NUL_IN_FILE_NAME
+                } else {
+                    "the descriptor-set sidecar is named after the stem alone and \
+                     written at the output root, so include files in two directories \
+                     would share it"
+                };
+                return Err(format!(
+                    "shared_descriptor_pool requires include_file to be a bare file name \
+                     ({reason}); got {include_name:?}"
+                )
+                .into());
             }
+            Some(format!("{stem}.descriptor_set.binpb"))
         } else {
             None
         };
@@ -1962,21 +2472,41 @@ impl Config {
         // `include!(concat!(env!("OUT_DIR"), "/_include.rs"))` from src/
         // still resolves to absolute paths.
         let relative_includes = self.out_dir.is_some();
+        // Those relative paths name siblings of the include file, so the
+        // include file has to sit in the output directory itself, with or
+        // without the shared pool (which has already required a bare name
+        // above). `$OUT_DIR` mode emits absolute paths, which resolve from any
+        // directory.
+        if let Some(include_name) = self.include_file.as_deref() {
+            if relative_includes && !is_bare_file_name(include_name) {
+                let reason = if include_name.contains('\0') {
+                    NUL_IN_FILE_NAME
+                } else {
+                    "the generated include! paths are relative to the include file"
+                };
+                return Err(format!(
+                    "include_file must be a bare file name when out_dir is set \
+                     ({reason}); got {include_name:?}"
+                )
+                .into());
+            }
+        }
         let out_dir = self
             .out_dir
             .or_else(|| std::env::var("OUT_DIR").ok().map(PathBuf::from))
             .ok_or("OUT_DIR not set and no out_dir configured")?;
 
         // Produce a FileDescriptorSet from the configured source.
-        let descriptor_bytes = match &self.descriptor_source {
-            DescriptorSource::Protoc => invoke_protoc(&self.files, &self.includes)?,
-            DescriptorSource::Buf => invoke_buf()?,
-            DescriptorSource::Precompiled(path) => std::fs::read(path).map_err(|e| {
-                format!("failed to read descriptor set '{}': {}", path.display(), e)
-            })?,
+        let descriptor_bytes: Cow<'_, [u8]> = match &self.descriptor_source {
+            DescriptorSource::Protoc => invoke_protoc(&self.files, &self.includes)?.into(),
+            DescriptorSource::Buf => invoke_buf()?.into(),
+            DescriptorSource::Precompiled(path) => std::fs::read(path)
+                .map_err(|e| format!("failed to read descriptor set '{}': {}", path.display(), e))?
+                .into(),
+            DescriptorSource::Bytes(bytes) => Cow::Borrowed(bytes),
         };
         // This descriptor set came from a protoc (or buf) invocation this build
-        // controls, or a path the caller named, so the bound is far above
+        // controls, or a path or bytes the caller supplied, so the bound is far above
         // buffa's untrusted-input default — that default is sized for wire
         // input and a schema of a few hundred `.proto` files exceeds it,
         // descriptor types being wide structs. Still finite, so a truncated or
@@ -1996,12 +2526,12 @@ impl Config {
         //
         // `FileDescriptorProto.name` contains the path relative to the proto
         // source root (protoc: `--proto_path`; buf: the module root). For
-        // Precompiled and Buf mode, `.files()` are expected to already be
-        // proto-relative names. For Protoc mode, strip the longest matching
+        // Precompiled, Bytes, and Buf mode, `.files()` are expected to already be
+        // proto-relative names. For Protoc mode, strip the first matching
         // include prefix.
         let files_to_generate: Vec<String> = if matches!(
             self.descriptor_source,
-            DescriptorSource::Precompiled(_) | DescriptorSource::Buf
+            DescriptorSource::Precompiled(_) | DescriptorSource::Bytes(_) | DescriptorSource::Buf
         ) {
             self.files
                 .iter()
@@ -2052,6 +2582,7 @@ impl Config {
 
         // Generate the include file if requested.
         if let Some(ref include_name) = self.include_file {
+            std::fs::create_dir_all(&out_dir)?;
             let tree = generate_include_file(&output_entries, relative_includes);
             let include_content = if let Some(sidecar) = sidecar {
                 // Embed the descriptor set once, at the tree root, instead of a
@@ -2060,9 +2591,11 @@ impl Config {
                 // the bytes never expand into Rust byte-literal source. Every
                 // package's `__buffa::reflect` delegates to that module.
                 // The sidecar name was derived from the include file's stem up
-                // front, so two compile() calls sharing an out_dir but writing
-                // different include files don't clobber each other's
-                // descriptor set.
+                // front, so two compile() calls sharing an out_dir don't
+                // clobber each other's descriptor set as long as their include
+                // file stems differ (`a.rs` and `b.rs`; `gen.rs` and `gen.txt`
+                // share `gen.descriptor_set.binpb`). The bare-name requirement
+                // keeps two directories from hiding one stem.
                 let fds_bytes = buffa_codegen::encode_descriptor_set(
                     &fds.file,
                     &self.codegen_config.feature_overrides,
@@ -2100,6 +2633,10 @@ impl Config {
                 tree
             };
             let include_path = out_dir.join(include_name);
+            // In `$OUT_DIR` mode the name may have a directory part.
+            if let Some(parent) = include_path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
             write_if_changed(&include_path, include_content.as_bytes())?;
         }
 
@@ -2128,10 +2665,35 @@ impl Config {
             DescriptorSource::Precompiled(ref path) => {
                 println!("cargo:rerun-if-changed={}", path.display());
             }
+            // The caller tracks the inputs used to produce these bytes.
+            DescriptorSource::Bytes(_) => {}
         }
 
         Ok(())
     }
+}
+
+/// The reason given when an include file name contains a NUL byte.
+const NUL_IN_FILE_NAME: &str = "a file name cannot contain a NUL byte";
+
+/// Whether `name` places a file directly in the directory it is joined to. A
+/// leading `./` is accepted; a backslash and a drive prefix are rejected on
+/// every platform, so one build script behaves the same everywhere. A name
+/// containing a NUL byte, which cannot name a file, is rejected too.
+fn is_bare_file_name(name: &str) -> bool {
+    let name = name.strip_prefix("./").unwrap_or(name);
+    if name.contains('/') || name.contains('\\') || name.contains('\0') {
+        return false;
+    }
+    if name.as_bytes().get(1) == Some(&b':')
+        && name.as_bytes().first().is_some_and(u8::is_ascii_alphabetic)
+    {
+        return false;
+    }
+    // With the separators and the drive prefix ruled out, `name` is one
+    // component: empty, `.`, `..`, or the file name itself.
+    let mut components = Path::new(name).components();
+    matches!(components.next(), Some(Component::Normal(_))) && components.next().is_none()
 }
 
 impl Default for Config {
@@ -2158,10 +2720,31 @@ fn normalize_attr_path(mut path: String) -> String {
     path
 }
 
-/// Normalize an `override_feature_in` / `preserve_unknown_fields_in` /
-/// `deny_unknown_json_fields_in` path:
-/// trim whitespace, prepend the leading dot if absent, and strip trailing
-/// dots. Unlike
+/// The minor version of the compiler that builds the crate, if `RUSTC` names
+/// one and it can be read.
+fn rustc_minor_version() -> Option<u32> {
+    let rustc = std::env::var_os("RUSTC")?;
+    let output = std::process::Command::new(rustc)
+        .arg("--version")
+        .output()
+        .ok()?;
+    parse_rustc_minor_version(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// The minor version in the output of `rustc --version`, such as `75` in
+/// `rustc 1.75.0 (82e1608df 2023-12-21)`.
+fn parse_rustc_minor_version(version_output: &str) -> Option<u32> {
+    version_output
+        .split_whitespace()
+        .nth(1)?
+        .split('.')
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
+/// Normalize a path-scoped rule's proto path: trim whitespace, prepend the
+/// leading dot if absent, and strip trailing dots. Unlike
 /// [`normalize_attr_path`], an entry that normalizes to empty (e.g. `"..."`)
 /// is returned empty rather than collapsing to the `"."` catch-all — the
 /// caller skips it, so `"."` stays the only global opt-in spelling.
@@ -2177,6 +2760,27 @@ fn normalize_override_path(path: &str) -> String {
         path.pop();
     }
     path
+}
+
+/// Normalize the paths given to the field-rule builder method `method` with
+/// [`normalize_override_path`]. An entry that normalizes to empty is skipped
+/// with a `cargo:warning`.
+fn field_rule_paths(method: &str, paths: &[impl AsRef<str>]) -> Vec<String> {
+    paths
+        .iter()
+        .map(AsRef::as_ref)
+        .filter_map(|raw| {
+            let normalized = normalize_override_path(raw);
+            if normalized.is_empty() {
+                println!(
+                    "cargo:warning=buffa: {method} path '{raw}' normalizes to empty \
+                     and will be ignored"
+                );
+                return None;
+            }
+            Some(normalized)
+        })
+        .collect()
 }
 
 /// Write `content` to `path` only if the file doesn't already exist with
@@ -2293,22 +2897,44 @@ fn emit_buf_rerun_if_changed() {
 /// Convert a filesystem proto path to the name protoc uses in the descriptor.
 ///
 /// `FileDescriptorProto.name` is relative to the `--proto_path` include
-/// directory. This strips the longest matching include prefix; if no include
-/// matches, returns the path as-is (not just file_name — that would break
-/// nested proto directories).
+/// directory. The name is what remains after the first include that is a
+/// prefix of the file and leaves no `..` in the remainder: protoc refuses to
+/// map a file through an include when the result would contain `..`, and
+/// tries the next one. If no include qualifies, the name is the full path
+/// (not just file_name — that would break nested proto directories).
+/// Current-directory components and redundant separators are removed first,
+/// as protoc does, without resolving symlinks or `..`.
 fn proto_relative_name(file: &Path, includes: &[PathBuf]) -> String {
-    // Longest prefix wins: a file under both "proto/" and "proto/vendor/"
-    // should strip "proto/vendor/" for a correct relative name.
-    let mut best: Option<&Path> = None;
-    for include in includes {
-        if let Ok(rel) = file.strip_prefix(include) {
-            match best {
-                Some(prev) if prev.as_os_str().len() <= rel.as_os_str().len() => {}
-                _ => best = Some(rel),
+    let file = normalize_proto_path(file);
+    let name = includes
+        .iter()
+        .find_map(|include| {
+            let include = normalize_proto_path(include);
+            // `.` contains every relative path and no rooted one. `has_root`
+            // also covers a Windows path that starts at the root of the
+            // current drive, which `is_absolute` reports as relative.
+            if include.as_os_str().is_empty() && file.has_root() {
+                return None;
             }
-        }
-    }
-    best.unwrap_or(file).to_str().unwrap_or("").to_string()
+            file.strip_prefix(include).ok().filter(|name| {
+                !name
+                    .components()
+                    .any(|component| component == Component::ParentDir)
+            })
+        })
+        .unwrap_or(&file)
+        .to_str()
+        .unwrap_or("")
+        .to_string();
+    #[cfg(windows)]
+    let name = name.replace('\\', "/");
+    name
+}
+
+fn normalize_proto_path(path: &Path) -> PathBuf {
+    path.components()
+        .filter(|component| *component != Component::CurDir)
+        .collect()
 }
 
 /// Files Cargo should watch for protoc-based builds.
@@ -2456,6 +3082,96 @@ mod tests {
     }
 
     #[test]
+    fn is_bare_file_name_accepts_names_in_the_joined_directory() {
+        for name in ["gen_mod.rs", ".gen_mod.rs", "gen_mod", "./gen_mod.rs"] {
+            assert!(is_bare_file_name(name), "{name:?} should be bare");
+        }
+    }
+
+    #[test]
+    fn is_bare_file_name_rejects_paths_and_nul() {
+        for name in [
+            "",
+            ".",
+            "./",
+            "..",
+            "../gen_mod.rs",
+            "nested/gen_mod.rs",
+            "nested\\gen_mod.rs",
+            "/gen_mod.rs",
+            "C:gen_mod.rs",
+            "gen_mod.rs/",
+            "gen_mod.rs\0",
+        ] {
+            assert!(!is_bare_file_name(name), "{name:?} should not be bare");
+        }
+    }
+
+    #[test]
+    fn shared_descriptor_pool_rejects_path_include_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("nested")).unwrap();
+
+        let err = Config::new()
+            .generate_reflection(true)
+            .shared_descriptor_pool(true)
+            .include_file("nested/gen_mod.rs")
+            .descriptor_set_bytes(Vec::new())
+            .out_dir(dir.path())
+            .compile()
+            .expect_err("shared descriptor include_file paths must be rejected");
+        let message = err.to_string();
+        assert!(
+            message.contains("bare file name") && message.contains("sidecar"),
+            "error should name the bare-file requirement and its reason: {message}"
+        );
+    }
+
+    #[test]
+    fn shared_descriptor_pool_rejects_nul_include_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = Config::new()
+            .generate_reflection(true)
+            .shared_descriptor_pool(true)
+            .include_file("gen_mod.rs\0")
+            .descriptor_set_bytes(Vec::new())
+            .out_dir(dir.path())
+            .compile()
+            .expect_err("shared descriptor include_file names must not contain NUL");
+        let message = err.to_string();
+        assert!(
+            message.contains("bare file name") && message.contains("NUL"),
+            "error should name the bare-file requirement and the NUL byte: {message}"
+        );
+        assert!(
+            !message.contains("sidecar"),
+            "a NUL name is not a path problem: {message}"
+        );
+    }
+
+    #[test]
+    fn explicit_out_dir_rejects_nul_include_file() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let err = Config::new()
+            .include_file("gen_mod.rs\0")
+            .descriptor_set_bytes(Vec::new())
+            .out_dir(dir.path())
+            .compile()
+            .expect_err("include_file names must not contain NUL");
+        let message = err.to_string();
+        assert!(
+            message.contains("bare file name") && message.contains("NUL"),
+            "error should name the bare-file requirement and the NUL byte: {message}"
+        );
+        assert!(
+            !message.contains("relative to the include file"),
+            "a NUL name is not a path problem: {message}"
+        );
+    }
+
+    #[test]
     fn shared_descriptor_pool_requires_reflection() {
         // Checked before include_file so the error names the first missing
         // prerequisite.
@@ -2574,6 +3290,50 @@ mod tests {
         );
     }
 
+    fn rule_paths<R>(rules: &[(String, R)]) -> Vec<&str> {
+        rules.iter().map(|(path, _)| path.as_str()).collect()
+    }
+
+    #[test]
+    fn type_in_builders_normalize_paths() {
+        // A missing leading dot, surrounding whitespace and a trailing dot
+        // are normalized; a blank entry is skipped, so `"."` is the only
+        // spelling of "every field".
+        let paths = &["my.pkg.Msg.field", " .my.pkg.Other. ", ".", "", " ", "..."];
+        let expected = [".my.pkg.Msg.field", ".my.pkg.Other", "."];
+        let config = Config::new()
+            .bytes_type_in(BytesRepr::Bytes, paths)
+            .string_type_in(StringRepr::String, paths)
+            .map_type_in(MapRepr::BTreeMap, paths)
+            .repeated_type_in(RepeatedRepr::Vec, paths)
+            .box_type_in(PointerRepr::Box, paths)
+            .unbox_oneof_in(paths)
+            .codegen_config;
+
+        assert_eq!(rule_paths(&config.bytes_fields), expected);
+        assert_eq!(rule_paths(&config.string_fields), expected);
+        assert_eq!(rule_paths(&config.map_fields), expected);
+        assert_eq!(rule_paths(&config.repeated_fields), expected);
+        assert_eq!(rule_paths(&config.pointer_fields), expected);
+        assert_eq!(config.unboxed_oneof_fields, expected);
+    }
+
+    #[test]
+    fn bytes_alias_and_custom_in_builders_normalize_paths() {
+        let config = Config::new()
+            .use_bytes_type_in(&["my.pkg.A.data"])
+            .bytes_type_custom_in("::my::Bytes", &["my.pkg.B.data"])
+            .string_type_custom_in("::my::Str", &["my.pkg.C.name"])
+            .map_type_custom_in("::my::Map", &["my.pkg.D.entries"])
+            .repeated_type_custom_in("::my::List<*>", &["my.pkg.E.items"])
+            .codegen_config;
+        assert_eq!(config.bytes_fields[0].0, ".my.pkg.A.data");
+        assert_eq!(config.bytes_fields[1].0, ".my.pkg.B.data");
+        assert_eq!(config.string_fields[0].0, ".my.pkg.C.name");
+        assert_eq!(config.map_fields[0].0, ".my.pkg.D.entries");
+        assert_eq!(config.repeated_fields[0].0, ".my.pkg.E.items");
+    }
+
     #[test]
     fn unbox_oneof_in_normalizes_leading_dot() {
         // Without normalization a dotless path would silently match nothing,
@@ -2588,6 +3348,59 @@ mod tests {
                 ".my.pkg.Other".to_string()
             ]
         );
+    }
+
+    #[test]
+    fn skip_debug_normalizes_and_accumulates_paths() {
+        let config = Config::new()
+            .skip_debug(&["demo.Uuid4", ".demo.Level.", "..."])
+            .skip_debug(&[" .demo.Other ", "."])
+            .codegen_config;
+        // `"..."` normalizes to empty and is dropped.
+        assert_eq!(
+            config.skip_debug,
+            [".demo.Uuid4", ".demo.Level", ".demo.Other", "."]
+        );
+    }
+
+    #[test]
+    fn codec_strategy_in_normalizes_paths_and_keeps_rule_order() {
+        let config = Config::new()
+            .codec_strategy(CodecStrategy::Table)
+            .codec_strategy_in(CodecStrategy::Unrolled, &["my.pkg.Msg", ".my.pkg.Other."])
+            .codec_strategy_in(CodecStrategy::Table, &[" .my.pkg.Msg.Inner ", "."])
+            .codegen_config;
+        assert_eq!(config.codec_strategy, CodecStrategy::Table);
+        assert_eq!(
+            config.codec_strategy_in,
+            vec![
+                (".my.pkg.Msg".to_string(), CodecStrategy::Unrolled),
+                (".my.pkg.Other".to_string(), CodecStrategy::Unrolled),
+                (".my.pkg.Msg.Inner".to_string(), CodecStrategy::Table),
+                (".".to_string(), CodecStrategy::Table),
+            ]
+        );
+    }
+
+    #[test]
+    fn rustc_minor_version_is_read_from_the_version_line() {
+        assert_eq!(
+            parse_rustc_minor_version("rustc 1.75.0 (82e1608df 2023-12-21)"),
+            Some(75)
+        );
+        assert_eq!(
+            parse_rustc_minor_version("rustc 1.98.0-nightly (abc 2027-01-01)\n"),
+            Some(98)
+        );
+        assert_eq!(parse_rustc_minor_version(""), None);
+        assert_eq!(parse_rustc_minor_version("not rustc"), None);
+    }
+
+    #[test]
+    fn codec_strategy_defaults_to_unrolled() {
+        let config = Config::new().codegen_config;
+        assert_eq!(config.codec_strategy, CodecStrategy::Unrolled);
+        assert!(config.codec_strategy_in.is_empty());
     }
 
     #[test]
@@ -2733,15 +3546,121 @@ mod tests {
     }
 
     #[test]
-    fn proto_relative_name_longest_prefix_wins() {
-        // Overlapping includes: file under both proto/ and proto/vendor/.
-        // Must strip the LONGER prefix for the correct relative name.
+    fn proto_relative_name_normalizes_current_directory_components() {
+        for (file, includes, expected) in [
+            (
+                "./proto/my/service.proto",
+                vec!["proto"],
+                "my/service.proto",
+            ),
+            (
+                "proto/my/service.proto",
+                vec!["./proto"],
+                "my/service.proto",
+            ),
+            (
+                "./proto/my/service.proto",
+                vec!["./proto"],
+                "my/service.proto",
+            ),
+            (
+                "proto/my/./service.proto",
+                vec!["proto"],
+                "my/service.proto",
+            ),
+            ("./my//pkg/./service.proto", vec![], "my/pkg/service.proto"),
+            ("./my/pkg/service.proto", vec!["."], "my/pkg/service.proto"),
+            ("my/pkg/service.proto", vec!["./."], "my/pkg/service.proto"),
+            (
+                "./my/pkg/service.proto",
+                vec!["other"],
+                "my/pkg/service.proto",
+            ),
+        ] {
+            let includes = includes.into_iter().map(PathBuf::from).collect::<Vec<_>>();
+            assert_eq!(proto_relative_name(Path::new(file), &includes), expected);
+        }
+    }
+
+    #[test]
+    fn proto_relative_name_normalization_preserves_include_order() {
+        let file = Path::new("./proto/vendor/./ext.proto");
+        assert_eq!(
+            proto_relative_name(
+                file,
+                &[PathBuf::from("./proto"), PathBuf::from("proto/vendor")]
+            ),
+            "vendor/ext.proto"
+        );
+        assert_eq!(
+            proto_relative_name(
+                file,
+                &[PathBuf::from("./proto/vendor"), PathBuf::from("proto")]
+            ),
+            "ext.proto"
+        );
+    }
+
+    #[test]
+    fn proto_relative_name_current_directory_include_contains_relative_files() {
+        // `.` listed first names the file by its full relative path, even
+        // when a later include is a closer match.
+        assert_eq!(
+            proto_relative_name(
+                Path::new("proto/my/service.proto"),
+                &[PathBuf::from("."), PathBuf::from("proto")]
+            ),
+            "proto/my/service.proto"
+        );
+    }
+
+    #[test]
+    fn proto_relative_name_current_directory_does_not_match_absolute_path() {
+        let root = std::env::current_dir().unwrap().join("proto");
+        let file = root.join("my/service.proto");
+        assert_eq!(
+            proto_relative_name(&file, &[PathBuf::from("."), root]),
+            "my/service.proto"
+        );
+    }
+
+    #[test]
+    fn proto_relative_name_preserves_parent_directory_components() {
+        assert_eq!(
+            proto_relative_name(Path::new("./proto/../vendor/service.proto"), &[]),
+            "proto/../vendor/service.proto"
+        );
+        assert_eq!(
+            proto_relative_name(
+                Path::new("./proto/../vendor/service.proto"),
+                &[PathBuf::from("proto/../vendor")],
+            ),
+            "service.proto"
+        );
+    }
+
+    #[test]
+    fn proto_relative_name_skips_prefixes_leaving_parent_components() {
+        assert_eq!(
+            proto_relative_name(
+                Path::new("./proto/../vendor/service.proto"),
+                &[
+                    PathBuf::from("."),
+                    PathBuf::from("proto"),
+                    PathBuf::from("proto/../vendor"),
+                ],
+            ),
+            "service.proto"
+        );
+    }
+
+    #[test]
+    fn proto_relative_name_first_matching_prefix_wins() {
         let got = proto_relative_name(
             Path::new("proto/vendor/ext.proto"),
             &[PathBuf::from("proto/"), PathBuf::from("proto/vendor/")],
         );
-        assert_eq!(got, "ext.proto");
-        // Same with reversed include order.
+        assert_eq!(got, "vendor/ext.proto");
         let got = proto_relative_name(
             Path::new("proto/vendor/ext.proto"),
             &[PathBuf::from("proto/vendor/"), PathBuf::from("proto/")],
@@ -2750,10 +3669,56 @@ mod tests {
     }
 
     #[test]
+    fn proto_relative_name_skips_unmatched_prefixes() {
+        let got = proto_relative_name(
+            Path::new("proto/vendor/ext.proto"),
+            &[
+                PathBuf::from("unrelated"),
+                PathBuf::from("proto/"),
+                PathBuf::from("proto/vendor/"),
+            ],
+        );
+        assert_eq!(got, "vendor/ext.proto");
+    }
+
+    #[test]
+    fn proto_relative_name_requires_a_complete_path_component() {
+        let got = proto_relative_name(
+            Path::new("proto/vendor2/ext.proto"),
+            &[PathBuf::from("proto/vendor"), PathBuf::from("proto/")],
+        );
+        assert_eq!(got, "vendor2/ext.proto");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn proto_relative_name_normalizes_windows_separators() {
+        let got = proto_relative_name(
+            Path::new(r"C:\proto\vendor\ext.proto"),
+            &[
+                PathBuf::from(r"C:\proto"),
+                PathBuf::from(r"C:\proto\vendor"),
+            ],
+        );
+        assert_eq!(got, "vendor/ext.proto");
+        let got = proto_relative_name(Path::new(r"vendor\ext.proto"), &[]);
+        assert_eq!(got, "vendor/ext.proto");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn proto_relative_name_preserves_literal_backslashes() {
+        let got = proto_relative_name(
+            Path::new(r"proto/vendor\ext.proto"),
+            &[PathBuf::from("proto")],
+        );
+        assert_eq!(got, r"vendor\ext.proto");
+    }
+
+    #[test]
     fn proto_relative_name_no_match_returns_full_path() {
-        // Regression: previously fell back to file_name(), which stripped
-        // directory components and broke descriptor_set() mode with nested
-        // proto packages. Now returns the full path as-is.
+        // The fallback is the whole path: file_name() alone would drop the
+        // directories that descriptor_set() mode needs for nested packages.
         let got = proto_relative_name(Path::new("my/pkg/service.proto"), &[]);
         assert_eq!(got, "my/pkg/service.proto");
     }
@@ -2871,6 +3836,128 @@ mod tests {
             !out.contains("OUT_DIR"),
             "relative mode must not reference OUT_DIR: {out}"
         );
+    }
+
+    fn config_with_excluded_package() -> Config {
+        use buffa_codegen::generated::descriptor::{DescriptorProto, FileDescriptorProto};
+
+        let file = FileDescriptorProto {
+            name: Some("example.proto".into()),
+            package: Some("example".into()),
+            syntax: Some("proto3".into()),
+            message_type: vec![DescriptorProto {
+                name: Some("Message".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        Config::new()
+            .descriptor_set_bytes(buffa_codegen::encode_descriptor_set(&[file], &[]))
+            .files(&["example.proto"])
+            .exclude_package("example")
+    }
+
+    #[test]
+    fn include_file_creates_output_directory_without_generated_files() {
+        for config in [
+            Config::new().descriptor_set_bytes(Vec::new()),
+            config_with_excluded_package(),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let out = dir.path().join("nested/gen");
+            assert!(!out.exists());
+
+            config
+                .out_dir(&out)
+                .include_file("gen_mod.rs")
+                .compile()
+                .unwrap();
+
+            assert_eq!(
+                std::fs::read_to_string(out.join("gen_mod.rs")).unwrap(),
+                generate_include_file(&[], true)
+            );
+            assert_eq!(std::fs::read_dir(&out).unwrap().count(), 1);
+        }
+    }
+
+    #[test]
+    fn shared_descriptor_pool_writes_output_without_generated_files() {
+        let config = config_with_excluded_package();
+        let DescriptorSource::Bytes(ref bytes) = config.descriptor_source else {
+            unreachable!();
+        };
+        let expected_bytes = bytes.clone();
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nested/gen");
+
+        config
+            .out_dir(&out)
+            .include_file("gen_mod.rs")
+            .generate_reflection(true)
+            .shared_descriptor_pool(true)
+            .compile()
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(out.join("gen_mod.descriptor_set.binpb")).unwrap(),
+            expected_bytes
+        );
+        let include = std::fs::read_to_string(out.join("gen_mod.rs")).unwrap();
+        assert!(include.contains("pub mod __buffa_fds"), "{include}");
+        assert!(
+            include.contains("\"gen_mod.descriptor_set.binpb\""),
+            "{include}"
+        );
+        assert_eq!(std::fs::read_dir(&out).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn include_file_preserves_existing_directory_without_generated_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let preserved = dir.path().join("existing.rs");
+        std::fs::write(&preserved, b"existing content").unwrap();
+
+        config_with_excluded_package()
+            .out_dir(dir.path())
+            .include_file("gen_mod.rs")
+            .compile()
+            .unwrap();
+
+        assert_eq!(std::fs::read(&preserved).unwrap(), b"existing content");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("gen_mod.rs")).unwrap(),
+            generate_include_file(&[], true)
+        );
+    }
+
+    #[test]
+    fn include_file_reports_output_directory_that_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("gen");
+        std::fs::write(&out, b"existing content").unwrap();
+
+        let err = config_with_excluded_package()
+            .out_dir(&out)
+            .include_file("gen_mod.rs")
+            .compile()
+            .unwrap_err();
+
+        assert!(err.downcast_ref::<std::io::Error>().is_some(), "{err}");
+        assert_eq!(std::fs::read(&out).unwrap(), b"existing content");
+    }
+
+    #[test]
+    fn compile_without_include_file_does_not_create_empty_output_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nested/gen");
+
+        config_with_excluded_package()
+            .out_dir(&out)
+            .compile()
+            .unwrap();
+
+        assert!(!out.exists());
     }
 
     #[test]
@@ -3002,6 +4089,24 @@ mod tests {
     }
 
     #[test]
+    fn oneof_struct_field_attribute_forwards_normalized_path() {
+        let cfg =
+            Config::new().oneof_struct_field_attribute("my.pkg.Msg.payload.", "#[serde(skip)]");
+        assert_eq!(
+            cfg.codegen_config.oneof_struct_field_attributes,
+            vec![(
+                ".my.pkg.Msg.payload".to_string(),
+                "#[serde(skip)]".to_string()
+            )]
+        );
+        assert!(cfg.codegen_config.oneof_attributes.is_empty());
+        assert!(cfg.codegen_config.field_attributes.is_empty());
+        assert!(cfg.codegen_config.type_attributes.is_empty());
+        assert!(cfg.codegen_config.message_attributes.is_empty());
+        assert!(cfg.codegen_config.enum_attributes.is_empty());
+    }
+
+    #[test]
     fn oneof_attribute_forwards_normalized_path() {
         let cfg = Config::new().oneof_attribute("my.pkg.Msg.payload.", "#[derive(Hash)]");
         assert_eq!(
@@ -3016,6 +4121,7 @@ mod tests {
         assert!(cfg.codegen_config.enum_attributes.is_empty());
         assert!(cfg.codegen_config.message_attributes.is_empty());
         assert!(cfg.codegen_config.field_attributes.is_empty());
+        assert!(cfg.codegen_config.oneof_struct_field_attributes.is_empty());
     }
 
     #[test]
@@ -3031,6 +4137,119 @@ mod tests {
             .map(|(_, a)| a.as_str())
             .collect();
         assert_eq!(paths, vec!["#[derive(A)]", "#[derive(B)]", "#[derive(C)]"]);
+    }
+
+    #[test]
+    fn descriptor_set_bytes_matches_file_input() {
+        use buffa_codegen::generated::descriptor::field_descriptor_proto::{Label, Type};
+        use buffa_codegen::generated::descriptor::{
+            DescriptorProto, FieldDescriptorProto, FileDescriptorProto,
+        };
+
+        let files = [
+            FileDescriptorProto {
+                name: Some("common/types.proto".into()),
+                package: Some("common".into()),
+                syntax: Some("proto3".into()),
+                message_type: vec![DescriptorProto {
+                    name: Some("Item".into()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            FileDescriptorProto {
+                name: Some("api/v1/service.proto".into()),
+                package: Some("api.v1".into()),
+                syntax: Some("proto3".into()),
+                dependency: vec!["common/types.proto".into()],
+                message_type: vec![DescriptorProto {
+                    name: Some("Request".into()),
+                    field: vec![FieldDescriptorProto {
+                        name: Some("item".into()),
+                        number: Some(1),
+                        label: Some(Label::LABEL_OPTIONAL),
+                        r#type: Some(Type::TYPE_MESSAGE),
+                        type_name: Some(".common.Item".into()),
+                        ..Default::default()
+                    }],
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+        ];
+        let bytes = buffa_codegen::encode_descriptor_set(&files, &[]);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("set.binpb");
+        std::fs::write(&path, &bytes).unwrap();
+
+        // The file and in-memory sources produce the same output, and
+        // `descriptor_set_bytes` replaces a previously configured file or
+        // `buf` source. No proto sources or external compiler are needed.
+        let configs = [
+            Config::new().descriptor_set(&path),
+            Config::new()
+                .descriptor_set(dir.path().join("missing.binpb"))
+                .descriptor_set_bytes(bytes.clone()),
+            Config::new().use_buf().descriptor_set_bytes(bytes),
+        ];
+        let mut outputs = Vec::new();
+        for (i, config) in configs.into_iter().enumerate() {
+            let out = dir.path().join(i.to_string());
+            config
+                .files(&["api/v1/service.proto"])
+                // Must not strip this prefix from descriptor-relative names.
+                .includes(&["api"])
+                .out_dir(&out)
+                .include_file("gen_mod.rs")
+                .generate_reflection(true)
+                .shared_descriptor_pool(true)
+                .compile()
+                .unwrap();
+            let generated: std::collections::BTreeMap<_, _> = std::fs::read_dir(&out)
+                .unwrap()
+                .map(|entry| {
+                    let entry = entry.unwrap();
+                    (entry.file_name(), std::fs::read(entry.path()).unwrap())
+                })
+                .collect();
+            let source = generated
+                .values()
+                .map(|bytes| String::from_utf8_lossy(bytes))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(source.contains("pub struct Request"));
+            assert!(!source.contains("pub struct Item"));
+            outputs.push(generated);
+        }
+        assert_eq!(outputs[0], outputs[1]);
+        assert_eq!(outputs[0], outputs[2]);
+    }
+
+    #[test]
+    fn descriptor_set_bytes_rejects_malformed_input() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("gen");
+        let err = Config::new()
+            .descriptor_set_bytes(vec![0xff])
+            .out_dir(&out)
+            .compile()
+            .unwrap_err();
+        assert!(err.to_string().contains("FileDescriptorSet"), "{err}");
+        assert!(!out.exists(), "invalid input must not produce output");
+    }
+
+    #[test]
+    fn descriptor_set_bytes_can_be_replaced() {
+        let cfg = Config::new().descriptor_set_bytes(Vec::new()).use_buf();
+        assert!(matches!(cfg.descriptor_source, DescriptorSource::Buf));
+
+        let cfg = Config::new()
+            .descriptor_set_bytes(Vec::new())
+            .descriptor_set("set.binpb");
+        assert!(matches!(
+            cfg.descriptor_source,
+            DescriptorSource::Precompiled(path) if path == Path::new("set.binpb")
+        ));
     }
 
     #[test]
