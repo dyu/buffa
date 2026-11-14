@@ -1955,6 +1955,9 @@ impl<E: crate::Enumeration> serde::Serialize for EnumProtoNameRef<'_, E> {
 /// Proto3 JSON omits such a field at its protobuf default. Generated
 /// `Serialize` impls attach these to the matching field types.
 pub mod skip_if {
+    pub fn is_zero<T: Default + PartialEq>(v: &T) -> bool {
+        *v == T::default()
+    }
     pub fn is_zero_i32(v: &i32) -> bool {
         *v == 0
     }
